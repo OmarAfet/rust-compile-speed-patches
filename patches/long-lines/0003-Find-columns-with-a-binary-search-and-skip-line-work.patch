@@ -1,0 +1,138 @@
+From 0a0576a00a44560398723a5998cd23b5764baba1 Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:46:36 +0300
+Subject: [PATCH 3/4] Find columns with a binary search, and skip line work
+ where only the file is used
+
+Three changes, with the same results as before:
+
+- `SourceFile::lookup_file_pos` computed the column by summing over every multi-byte char from the start of the file, twice per call, so each lookup was O(file). A binary search now finds the multi-byte chars of the current line.
+- `lookup_file_pos_with_col_display` takes the line prefix as `src[line start..pos]` when the source is loaded, instead of `get_line`, which searched for the end of the line on every call (O(line)). A prefix that ends with a newline (only a position at the end of a file that ends with a newline) keeps the old path, because the old code stops the display width at the newline.
+- A debug info scope lookup used `lookup_char_pos(pos).file`; `lookup_source_file(pos)` gives the same file.
+
+The new test `lookup_char_pos_matches_reference` compares line, column and display column at every char boundary of files with multi-byte chars, tabs, wide chars, CRLF and a BOM against the original algorithm written out. It passes before and after this change; a first version of the fast path failed it at the end of a file.
+---
+ .../rustc_codegen_ssa/src/mir/debuginfo.rs    |  3 +-
+ compiler/rustc_span/src/lib.rs                | 36 +++++++++++++++----
+ compiler/rustc_span/src/source_map/tests.rs   | 35 ++++++++++++++++++
+ 3 files changed, 67 insertions(+), 7 deletions(-)
+
+diff --git a/compiler/rustc_codegen_ssa/src/mir/debuginfo.rs b/compiler/rustc_codegen_ssa/src/mir/debuginfo.rs
+index 9735d0fa5..9812a8069 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/debuginfo.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/debuginfo.rs
+@@ -89,7 +89,8 @@ pub fn adjust_dbg_scope_for_span<
+         let pos = span.lo();
+         if pos < self.file_start_pos || pos >= self.file_end_pos {
+             let sm = bx.sess().source_map();
+-            bx.extend_scope_to_file(self.dbg_scope, &sm.lookup_char_pos(pos).file)
++            // Only the file is needed; `lookup_char_pos` would also compute line and column.
++            bx.extend_scope_to_file(self.dbg_scope, &sm.lookup_source_file(pos))
+         } else {
+             self.dbg_scope
+         }
+diff --git a/compiler/rustc_span/src/lib.rs b/compiler/rustc_span/src/lib.rs
+index 9c810b7b1..e0d45296a 100644
+--- a/compiler/rustc_span/src/lib.rs
++++ b/compiler/rustc_span/src/lib.rs
+@@ -2494,20 +2494,32 @@ fn bytepos_to_file_charpos(&self, bpos: RelativeBytePos) -> CharPos {
+     /// Looks up the file's (1-based) line number and (0-based `CharPos`) column offset, for a
+     /// given `RelativeBytePos`.
+     fn lookup_file_pos(&self, pos: RelativeBytePos) -> (usize, CharPos) {
+-        let chpos = self.bytepos_to_file_charpos(pos);
+         match self.lookup_line(pos) {
+             Some(a) => {
+                 let line = a + 1; // Line numbers start at 1
+                 let linebpos = self.lines()[a];
+-                let linechpos = self.bytepos_to_file_charpos(linebpos);
+-                let col = chpos - linechpos;
++                // The column is the byte distance from the line start minus the extra bytes of
++                // the multi-byte chars between the line start and `pos`. Only those chars matter,
++                // so find them with a binary search instead of summing over every multi-byte char
++                // from the start of the file (twice), which made each lookup O(file).
++                let first = self.multibyte_chars.partition_point(|mbc| mbc.pos < linebpos);
++                let mut extra_bytes = 0;
++                for mbc in &self.multibyte_chars[first..] {
++                    if mbc.pos >= pos {
++                        break;
++                    }
++                    // We should never see a byte position in the middle of a character.
++                    assert!(pos.to_u32() >= mbc.pos.to_u32() + mbc.bytes as u32);
++                    extra_bytes += mbc.bytes as u32 - 1;
++                }
++                let line_bytes = (pos - linebpos).to_u32();
++                assert!(extra_bytes <= line_bytes);
++                let col = CharPos((line_bytes - extra_bytes) as usize);
+                 debug!("byte pos {:?} is on the line at byte pos {:?}", pos, linebpos);
+-                debug!("char pos {:?} is on the line at char pos {:?}", chpos, linechpos);
+                 debug!("byte is on line: {}", line);
+-                assert!(chpos >= linechpos);
+                 (line, col)
+             }
+-            None => (0, chpos),
++            None => (0, self.bytepos_to_file_charpos(pos)),
+         }
+     }
+ 
+@@ -2517,6 +2529,18 @@ pub fn lookup_file_pos_with_col_display(&self, pos: BytePos) -> (usize, CharPos,
+         let pos = self.relative_position(pos);
+         let (line, col_or_chpos) = self.lookup_file_pos(pos);
+         if line > 0 {
++            // Fast path: with the source text loaded, the `col_or_chpos` chars before `pos` on
++            // this line are exactly `src[line start..pos]`. Slicing them avoids `get_line`, which
++            // searches for the end of the line and so costs O(line length) on every call.
++            // A prefix that ends with '\n' (only `pos` at the end of a file that ends with a
++            // newline) takes the old path, which stops the display width at the newline.
++            if let Some(src) = self.src.as_deref()
++                && let Some(prefix) = src.get(self.lines()[line - 1].to_usize()..pos.to_usize())
++                && !prefix.ends_with('\n')
++            {
++                debug_assert_eq!(prefix.chars().count(), col_or_chpos.0);
++                return (line, col_or_chpos, prefix_display_width(prefix, col_or_chpos.0));
++            }
+             let Some(code) = self.get_line(line - 1) else {
+                 // If we don't have the code available, it is ok as a fallback to return the bytepos
+                 // instead of the "display" column, which is only used to properly show underlines
+diff --git a/compiler/rustc_span/src/source_map/tests.rs b/compiler/rustc_span/src/source_map/tests.rs
+index 4cc243667..aaa6f67c6 100644
+--- a/compiler/rustc_span/src/source_map/tests.rs
++++ b/compiler/rustc_span/src/source_map/tests.rs
+@@ -797,3 +797,38 @@ fn read_binary_file_handles_lying_stat() {
+     let bin = RealFileLoader.read_binary_file(kernel_max).unwrap();
+     assert_eq!(&real[..], &bin[..]);
+ }
++
++/// Checks `lookup_char_pos` (line, column, display column) at every char boundary (and the
++/// end) of files with multi-byte chars, tabs, wide chars, CRLF line ends (normalized) and a
++/// byte-order mark (removed) against the original algorithm written out directly: column =
++/// chars from the line start, display column = `char_width` of those chars up to the newline.
++#[test]
++fn lookup_char_pos_matches_reference() {
++    let sm = SourceMap::new(FilePathMapping::empty());
++    let sources = [
++        "fn main() {\n\tlet x = 1;\n}\n",
++        "fir€st €€€€ line.\nsecond line\n\t€\ttab\n",
++        "\u{feff}// bom\r\nlet s = \"\u{4f60}\u{597d}\";\r\n\t\u{1f600} end",
++        "no newline at all, \u{e9}\u{e9}\u{e9} and \t tabs \t",
++        "\n\n\u{200b}\n\t\t\u{202e}x\n",
++    ];
++    for (i, text) in sources.iter().enumerate() {
++        let sf = sm.new_source_file(filename(&sm, &format!("f{i}.rs")), text.to_string());
++        let src: String = sf.src.as_deref().unwrap().clone();
++        let lines: Vec<usize> = sf.lines().iter().map(|l| l.to_usize()).collect();
++        let positions = src.char_indices().map(|(b, _)| b).chain([src.len()]);
++        for byte in positions {
++            let line_idx = lines.partition_point(|&start| start <= byte) - 1;
++            let line_text = &src[lines[line_idx]..];
++            let col = src[lines[line_idx]..byte].chars().count();
++            let line_text = line_text.split('\n').next().unwrap();
++            let col_display: usize = line_text.chars().take(col).map(char_width).sum();
++            let loc = sm.lookup_char_pos(sf.start_pos + BytePos(byte as u32));
++            assert_eq!(
++                (loc.line, loc.col.0, loc.col_display),
++                (line_idx + 1, col, col_display),
++                "file {i}, byte {byte}"
++            );
++        }
++    }
++}

@@ -1,0 +1,87 @@
+From e071a3f2281cf41e054f8f18d7afb19f649abf00 Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:46:35 +0300
+Subject: [PATCH 2/4] Compute the display width of an ASCII line prefix without
+ a char walk
+
+`lookup_file_pos_with_col_display` summed `char_width` over every char of the line prefix. For an ASCII prefix the chars are the bytes, and `char_width` is 1 for every ASCII char except tab (4), so the width is the length plus three per tab: a byte scan. Panic locations (`span_as_caller_location`) ask for display columns of many positions on the same line, so on one long line of generated code this dominated compile time.
+
+`prefix_display_width` returns the same value as the char walk; a unit test compares the two on ASCII, tabs, multi-byte and wide chars.
+---
+ compiler/rustc_span/src/lib.rs   | 20 +++++++++++++++++++-
+ compiler/rustc_span/src/tests.rs | 27 +++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/rustc_span/src/lib.rs b/compiler/rustc_span/src/lib.rs
+index f048fb04a..9c810b7b1 100644
+--- a/compiler/rustc_span/src/lib.rs
++++ b/compiler/rustc_span/src/lib.rs
+@@ -2528,7 +2528,7 @@ pub fn lookup_file_pos_with_col_display(&self, pos: BytePos) -> (usize, CharPos,
+                 tracing::info!("couldn't find line {line} {:?}", self.name);
+                 return (line, col_or_chpos, col_or_chpos.0);
+             };
+-            let display_col = code.chars().take(col_or_chpos.0).map(|ch| char_width(ch)).sum();
++            let display_col = prefix_display_width(&code, col_or_chpos.0);
+             (line, col_or_chpos, display_col)
+         } else {
+             // This is never meant to happen?
+@@ -2560,6 +2560,24 @@ pub fn str_width(s: &str) -> usize {
+     s.chars().map(char_width).sum()
+ }
+ 
++/// Display width of the first `chars` chars of `line`; the same value as
++/// `line.chars().take(chars).map(char_width).sum()`.
++///
++/// Fast path: if those chars are all ASCII, they are exactly the first `chars` bytes, and
++/// `char_width` is 1 for every ASCII char except `'\t'` (4). That needs only a byte scan, which
++/// matters for very long lines (for example generated code on one line), where this function
++/// is called for many positions on the same line.
++pub(crate) fn prefix_display_width(line: &str, chars: usize) -> usize {
++    let bytes = line.as_bytes();
++    if let Some(prefix) = bytes.get(..chars)
++        && prefix.is_ascii()
++    {
++        let tabs = prefix.iter().filter(|&&b| b == b'\t').count();
++        return chars + 3 * tabs;
++    }
++    line.chars().take(chars).map(char_width).sum()
++}
++
+ /// Normalizes the source code and records the normalizations.
+ fn normalize_src(src: &mut String) -> Vec<NormalizedPos> {
+     let mut normalized_pos = vec![];
+diff --git a/compiler/rustc_span/src/tests.rs b/compiler/rustc_span/src/tests.rs
+index 64c40e611..276d77f9b 100644
+--- a/compiler/rustc_span/src/tests.rs
++++ b/compiler/rustc_span/src/tests.rs
+@@ -117,3 +117,30 @@ fn test_unnormalized_source_length() {
+     assert_eq!(sf.unnormalized_source_len, 19);
+     assert_eq!(sf.normalized_source_len.0, 14);
+ }
++
++#[test]
++fn prefix_display_width_matches_char_width() {
++    let lines = [
++        "",
++        "fn main() { let x = 1; }",
++        "\tlet\tx = 1;\t",
++        "a\u{0}b\u{7f}c\rd\u{1b}e",
++        "let s = \"\u{4f60}\u{597d}\"; // wide",
++        "emoji \u{1f600} and zero width \u{200b} here",
++        "\u{202e}bidi\u{2066}x\u{2069}",
++        "tab\tthen \u{e9}\tafter",
++    ];
++    for line in lines {
++        let n = line.chars().count();
++        for chars in 0..=n + 2 {
++            let expected: usize = line.chars().take(chars).map(char_width).sum();
++            assert_eq!(prefix_display_width(line, chars), expected, "line {line:?}, chars {chars}");
++        }
++    }
++    // A long ASCII line, as in generated code.
++    let long = "x, ".repeat(100_000) + "\t\t";
++    for chars in [0, 1, 7, 299_999, 300_000, 300_001, 300_002] {
++        let expected: usize = long.chars().take(chars).map(char_width).sum();
++        assert_eq!(prefix_display_width(&long, chars), expected);
++    }
++}

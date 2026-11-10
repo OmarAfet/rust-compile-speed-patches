@@ -1,0 +1,90 @@
+From de3a3445f92aa7d96f7fd4ee0ded3d1a1e77c7f7 Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 05:47:54 +0300
+Subject: [PATCH] Use a `MixedBitSet` for `EverInitializedPlaces`
+
+Since its domain became a `DenseBitSet<Local>`, every basic block's entry state in `EverInitializedPlaces` holds one bit per local, so borrow checking a body costs at least blocks x locals / 64 words, and joining and cloning those states dominated borrow checking of very large bodies, such as generated functions that build a huge `vec![...]`.
+
+`MixedBitSet` is a `DenseBitSet` for domains of up to 2,048 elements, so normal functions keep the same code path, and a `ChunkedBitSet` above that, where all-zero and all-one chunks need no words. The other two borrowck analyses already use it.
+
+Measured on an Apple M2 with one function returning a `vec!` of N structs: borrow checking took 4.16 s at N = 8,000 (6.6 MB of source) before and 1.93 s after; it grew 4x per doubling before, about 2.5x after. Type checking of the same function grows linearly (1.17 s). SteelMC's `steel-registry`: borrow checking 1.99-2.04 s before, 1.79-1.87 s after.
+
+The new ui test reassigns an immutable local in a body with 4,098 locals (counted in the MIR the borrow checker sees), so the chunked representation is used; its error output is byte-identical with and without this change. Borrowck diagnostics of 15 generated cases with up to 9,621 locals were also identical.
+---
+ .../rustc_mir_dataflow/src/impls/initialized.rs |  7 +++++--
+ ...assign-immutable-in-body-with-many-locals.rs | 17 +++++++++++++++++
+ ...gn-immutable-in-body-with-many-locals.stderr | 16 ++++++++++++++++
+ 3 files changed, 38 insertions(+), 2 deletions(-)
+ create mode 100644 tests/ui/borrowck/reassign-immutable-in-body-with-many-locals.rs
+ create mode 100644 tests/ui/borrowck/reassign-immutable-in-body-with-many-locals.stderr
+
+diff --git a/compiler/rustc_mir_dataflow/src/impls/initialized.rs b/compiler/rustc_mir_dataflow/src/impls/initialized.rs
+index df492bb7d..284e1c77a 100644
+--- a/compiler/rustc_mir_dataflow/src/impls/initialized.rs
++++ b/compiler/rustc_mir_dataflow/src/impls/initialized.rs
+@@ -671,7 +671,10 @@ fn move_data(&self) -> &MoveData<'tcx> {
+     }
+ }
+ 
+-pub type EverInitializedPlacesDomain = DenseBitSet<Local>;
++// `MixedBitSet` is a `DenseBitSet` for bodies with up to 2048 locals. Larger bodies (e.g. a
++// huge generated `vec![...]`) get a `ChunkedBitSet`, whose all-zero and all-one chunks need no
++// words: a dense set over all locals in every block's entry state made those bodies quadratic.
++pub type EverInitializedPlacesDomain = MixedBitSet<Local>;
+ 
+ impl<'tcx> Analysis<'tcx> for EverInitializedPlaces<'_, 'tcx> {
+     type Domain = EverInitializedPlacesDomain;
+@@ -680,7 +683,7 @@ impl<'tcx> Analysis<'tcx> for EverInitializedPlaces<'_, 'tcx> {
+ 
+     fn bottom_value(&self, body: &mir::Body<'tcx>) -> Self::Domain {
+         // bottom = no initialized locals by default
+-        DenseBitSet::new_empty(body.local_decls.len())
++        MixedBitSet::new_empty(body.local_decls.len())
+     }
+ 
+     fn initialize_start_block(&self, body: &mir::Body<'tcx>, state: &mut Self::Domain) {
+diff --git a/tests/ui/borrowck/reassign-immutable-in-body-with-many-locals.rs b/tests/ui/borrowck/reassign-immutable-in-body-with-many-locals.rs
+new file mode 100644
+index 000000000..b651e69d3
+--- /dev/null
++++ b/tests/ui/borrowck/reassign-immutable-in-body-with-many-locals.rs
+@@ -0,0 +1,17 @@
++// A body with more than 2,048 locals, where the borrow checker's `EverInitializedPlaces` analysis
++// uses the chunked representation of `MixedBitSet`. Reassigning an immutable local must report the
++// same error as in a small body.
++
++macro_rules! x2 {
++    ($($t:tt)*) => { $($t)* $($t)* };
++}
++
++fn main() {
++    // 4,096 locals.
++    x2! { x2! { x2! { x2! { x2! { x2! { x2! { x2! { x2! { x2! { x2! { x2! {
++        let _a = 0u8;
++    } } } } } } } } } } } }
++    let x = 1;
++    x = 2; //~ ERROR cannot assign twice to immutable variable `x`
++    let _ = x;
++}
+diff --git a/tests/ui/borrowck/reassign-immutable-in-body-with-many-locals.stderr b/tests/ui/borrowck/reassign-immutable-in-body-with-many-locals.stderr
+new file mode 100644
+index 000000000..33bb8e7fd
+--- /dev/null
++++ b/tests/ui/borrowck/reassign-immutable-in-body-with-many-locals.stderr
+@@ -0,0 +1,16 @@
++error[E0384]: cannot assign twice to immutable variable `x`
++  --> $DIR/reassign-immutable-in-body-with-many-locals.rs:15:5
++   |
++LL |     let x = 1;
++   |         - first assignment to `x`
++LL |     x = 2;
++   |     ^^^^^ cannot assign twice to immutable variable
++   |
++help: consider making this binding mutable
++   |
++LL |     let mut x = 1;
++   |         +++
++
++error: aborting due to 1 previous error
++
++For more information about this error, try `rustc --explain E0384`.

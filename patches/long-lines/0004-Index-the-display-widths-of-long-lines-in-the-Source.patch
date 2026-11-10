@@ -1,0 +1,226 @@
+From 0dd0a3d5d093a0aedc53cdf2dfdc2ab66fd5d5f4 Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:46:36 +0300
+Subject: [PATCH 4/4] Index the display widths of long lines in the `SourceMap`
+
+After the previous changes, a display column on a long line still needed a byte scan of the line prefix, so many panic locations on one long line stayed quadratic.
+
+For a prefix longer than 4,096 bytes, the display column now comes from a per-file `DisplayWidthIndex`: the positions of the chars on long lines whose `char_width` is not 1 (tabs, and wide or zero-width chars from `multibyte_chars`), with running totals of `char_width - 1`. The display column is the column plus the difference of two totals, found with binary searches. The indexes live in a `LongLineWidths` cache in the `SourceMap`, built on first use, so files without such lines cost nothing and `SourceFile` does not grow. Only `lookup_char_pos`, which has the `SourceMap`, uses it; other callers keep the direct scan.
+
+The reference test now has two lines longer than 4,096 bytes with tabs, wide, zero-width and multi-byte chars, so the index is checked at every char boundary.
+
+Measured with 822182db4 on an Apple M2, outputs byte-identical: 10,000 panic locations on one long line 82.0 s before 0001, 8.0 s after 0003, 2.1 s with this change (the same code on short lines: 2.1 s). SteelMC's `steel-registry` compiles in 18.3-19.8 s instead of 52.4-52.9 s with all four changes.
+---
+ compiler/rustc_span/src/lib.rs              | 110 +++++++++++++++++++-
+ compiler/rustc_span/src/source_map.rs       |   9 +-
+ compiler/rustc_span/src/source_map/tests.rs |   9 +-
+ 3 files changed, 125 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/rustc_span/src/lib.rs b/compiler/rustc_span/src/lib.rs
+index e0d45296a..c053569a7 100644
+--- a/compiler/rustc_span/src/lib.rs
++++ b/compiler/rustc_span/src/lib.rs
+@@ -84,6 +84,7 @@
+ 
+ pub use macros::{bug, span_bug};
+ use md5::{Digest, Md5};
++use rustc_data_structures::fx::FxHashMap;
+ use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+ use rustc_data_structures::sync::{FreezeLock, FreezeWriteGuard, Lock};
+ use rustc_data_structures::unord::UnordMap;
+@@ -2526,6 +2527,16 @@ fn lookup_file_pos(&self, pos: RelativeBytePos) -> (usize, CharPos) {
+     /// Looks up the file's (1-based) line number, (0-based `CharPos`) column offset, and (0-based)
+     /// column offset when displayed, for a given `BytePos`.
+     pub fn lookup_file_pos_with_col_display(&self, pos: BytePos) -> (usize, CharPos, usize) {
++        self.lookup_file_pos_with_col_display_using(pos, None)
++    }
++
++    /// Like `lookup_file_pos_with_col_display`; with `long_lines`, the display column of a long
++    /// line prefix comes from a cached index instead of a scan of the prefix. See `LongLineWidths`.
++    pub(crate) fn lookup_file_pos_with_col_display_using(
++        &self,
++        pos: BytePos,
++        long_lines: Option<&LongLineWidths>,
++    ) -> (usize, CharPos, usize) {
+         let pos = self.relative_position(pos);
+         let (line, col_or_chpos) = self.lookup_file_pos(pos);
+         if line > 0 {
+@@ -2539,7 +2550,15 @@ pub fn lookup_file_pos_with_col_display(&self, pos: BytePos) -> (usize, CharPos,
+                 && !prefix.ends_with('\n')
+             {
+                 debug_assert_eq!(prefix.chars().count(), col_or_chpos.0);
+-                return (line, col_or_chpos, prefix_display_width(prefix, col_or_chpos.0));
++                let display_col = match long_lines {
++                    Some(long_lines) if prefix.len() > LongLineWidths::MIN_PREFIX => {
++                        let line_start = self.lines()[line - 1];
++                        let extra = long_lines.index_for(self, src).extra_width(line_start..pos);
++                        (col_or_chpos.0 as i64 + extra) as usize
++                    }
++                    _ => prefix_display_width(prefix, col_or_chpos.0),
++                };
++                return (line, col_or_chpos, display_col);
+             }
+             let Some(code) = self.get_line(line - 1) else {
+                 // If we don't have the code available, it is ok as a fallback to return the bytepos
+@@ -2602,6 +2621,95 @@ pub(crate) fn prefix_display_width(line: &str, chars: usize) -> usize {
+     line.chars().take(chars).map(char_width).sum()
+ }
+ 
++/// Cache of `DisplayWidthIndex`es, one per source file that has a line prefix longer than
++/// `MIN_PREFIX` bytes whose display column was asked for. Lives in the `SourceMap`, so files
++/// without such lines cost nothing. Without it, each display column of a long line needs a scan
++/// of the line prefix, which makes many lookups on one long line (for example panic locations in
++/// generated code written on one line) quadratic.
++#[derive(Default)]
++pub(crate) struct LongLineWidths {
++    indexes: Lock<FxHashMap<BytePos, Arc<DisplayWidthIndex>>>,
++}
++
++impl LongLineWidths {
++    /// Shorter prefixes are scanned directly; that is cheaper than an index lookup.
++    const MIN_PREFIX: usize = 4096;
++
++    fn index_for(&self, sf: &SourceFile, src: &str) -> Arc<DisplayWidthIndex> {
++        // Files are identified by their start position, which is unique within a `SourceMap`.
++        let mut indexes = self.indexes.lock();
++        Arc::clone(indexes.entry(sf.start_pos).or_insert_with(|| {
++            Arc::new(DisplayWidthIndex::new(src, sf.lines(), &sf.multibyte_chars))
++        }))
++    }
++}
++
++/// For the long lines of one file (longer than `LongLineWidths::MIN_PREFIX` bytes): the chars
++/// whose display width is not 1, with the running total of `char_width(ch) - 1`. The display
++/// width of a prefix of such a line is then `chars in the prefix + (total at its end - total at
++/// its start)`: two binary searches.
++pub(crate) struct DisplayWidthIndex {
++    positions: Vec<RelativeBytePos>,
++    running_extra: Vec<i64>,
++}
++
++impl DisplayWidthIndex {
++    fn new(src: &str, lines: &[RelativeBytePos], multibyte_chars: &[MultiByteChar]) -> Self {
++        let (mut positions, mut running_extra, mut total) = (Vec::new(), Vec::new(), 0i64);
++        let mut push = |pos: usize, extra: i64| {
++            total += extra;
++            positions.push(RelativeBytePos(pos as u32));
++            running_extra.push(total);
++        };
++        for (i, &start) in lines.iter().enumerate() {
++            let (start, end) =
++                (start.to_usize(), lines.get(i + 1).map_or(src.len(), |next| next.to_usize()));
++            if end - start <= LongLineWidths::MIN_PREFIX {
++                continue;
++            }
++            // `char_width` is 1 for every ASCII char except tab (4); a newline is never inside a
++            // line prefix. So only tabs and multi-byte chars of this line can have an entry. Both
++            // lists are in source order; merge them.
++            let mut tabs = src.as_bytes()[start..end]
++                .iter()
++                .enumerate()
++                .filter(|&(_, &b)| b == b'\t')
++                .map(|(i, _)| (start + i, 3))
++                .peekable();
++            let first = multibyte_chars.partition_point(|mbc| mbc.pos.to_usize() < start);
++            let mut wide = multibyte_chars[first..]
++                .iter()
++                .take_while(|mbc| mbc.pos.to_usize() < end)
++                .filter_map(|mbc| {
++                    let i = mbc.pos.to_usize();
++                    let extra = char_width(src[i..].chars().next()?) as i64 - 1;
++                    (extra != 0).then_some((i, extra))
++                })
++                .peekable();
++            loop {
++                let take_tab = match (tabs.peek(), wide.peek()) {
++                    (Some(tab), Some(w)) => tab.0 < w.0,
++                    (Some(_), None) => true,
++                    (None, Some(_)) => false,
++                    (None, None) => break,
++                };
++                let (i, extra) = if take_tab { tabs.next() } else { wide.next() }.unwrap();
++                push(i, extra);
++            }
++        }
++        DisplayWidthIndex { positions, running_extra }
++    }
++
++    /// Sum of `char_width(ch) - 1` over the indexed chars that start in `range`.
++    fn extra_width(&self, range: Range<RelativeBytePos>) -> i64 {
++        let total_before = |pos: RelativeBytePos| {
++            let n = self.positions.partition_point(|&p| p < pos);
++            if n == 0 { 0 } else { self.running_extra[n - 1] }
++        };
++        total_before(range.end) - total_before(range.start)
++    }
++}
++
+ /// Normalizes the source code and records the normalizations.
+ fn normalize_src(src: &mut String) -> Vec<NormalizedPos> {
+     let mut normalized_pos = vec![];
+diff --git a/compiler/rustc_span/src/source_map.rs b/compiler/rustc_span/src/source_map.rs
+index 33dc25446..b7613cd29 100644
+--- a/compiler/rustc_span/src/source_map.rs
++++ b/compiler/rustc_span/src/source_map.rs
+@@ -208,6 +208,9 @@ pub struct SourceMap {
+     /// The algorithm used for hashing the contents of each source file.
+     hash_kind: SourceFileHashAlgorithm,
+ 
++    /// Display-width indexes for files with very long lines; empty for normal files.
++    long_line_widths: LongLineWidths,
++
+     /// Similar to `hash_kind`, however this algorithm is used for checksums to determine if a crate is fresh.
+     /// `cargo` is the primary user of these.
+     ///
+@@ -224,6 +227,8 @@ fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+             working_dir,
+             hash_kind,
+             checksum_hash_kind,
++            // A cache of derived data; not useful in debug output.
++            long_line_widths: _,
+         } = self;
+ 
+         f.debug_struct("SourceMap")
+@@ -262,6 +267,7 @@ pub fn with_inputs(
+             path_mapping,
+             hash_kind,
+             checksum_hash_kind,
++            long_line_widths: Default::default(),
+         }
+     }
+ 
+@@ -448,7 +454,8 @@ pub fn lookup_source_file(&self, pos: BytePos) -> Arc<SourceFile> {
+     /// Looks up source information about a `BytePos`.
+     pub fn lookup_char_pos(&self, pos: BytePos) -> Loc {
+         let sf = self.lookup_source_file(pos);
+-        let (line, col, col_display) = sf.lookup_file_pos_with_col_display(pos);
++        let (line, col, col_display) =
++            sf.lookup_file_pos_with_col_display_using(pos, Some(&self.long_line_widths));
+         Loc { file: sf, line, col, col_display }
+     }
+ 
+diff --git a/compiler/rustc_span/src/source_map/tests.rs b/compiler/rustc_span/src/source_map/tests.rs
+index aaa6f67c6..09450dddd 100644
+--- a/compiler/rustc_span/src/source_map/tests.rs
++++ b/compiler/rustc_span/src/source_map/tests.rs
+@@ -805,12 +805,19 @@ fn read_binary_file_handles_lying_stat() {
+ #[test]
+ fn lookup_char_pos_matches_reference() {
+     let sm = SourceMap::new(FilePathMapping::empty());
+-    let sources = [
++    let sources: [&str; 6] = [
+         "fn main() {\n\tlet x = 1;\n}\n",
+         "fir€st €€€€ line.\nsecond line\n\t€\ttab\n",
+         "\u{feff}// bom\r\nlet s = \"\u{4f60}\u{597d}\";\r\n\t\u{1f600} end",
+         "no newline at all, \u{e9}\u{e9}\u{e9} and \t tabs \t",
+         "\n\n\u{200b}\n\t\t\u{202e}x\n",
++        // Lines longer than the 4096-byte direct-scan limit, so the long-line index is used:
++        // tabs, wide, zero-width and multi-byte chars spread along them, a short line between.
++        &format!(
++            "{}\nshort\t\u{4f60}\n{}",
++            "ab\t\u{4f60}c\u{200b}d\u{e9}\u{1f600}efgh".repeat(400),
++            "x\ty\u{202e}z".repeat(1000)
++        ),
+     ];
+     for (i, text) in sources.iter().enumerate() {
+         let sf = sm.new_source_file(filename(&sm, &format!("f{i}.rs")), text.to_string());

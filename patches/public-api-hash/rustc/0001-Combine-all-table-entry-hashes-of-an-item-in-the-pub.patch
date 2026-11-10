@@ -1,0 +1,107 @@
+From 6f29ec0a1dec378aa557b82088d6751781fe6c76 Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:49:19 +0300
+Subject: [PATCH 1/5] Combine all table entry hashes of an item in the public
+ API hash
+
+`ReachabilityGraphHashes::add_node_hash` is called once for each metadata table entry of an item, but it replaced the item's hash with `hash.combine_commutative(hash)`, which ignores the hash so far. So only the last entry encoded for an item counted, and a change in any earlier entry did not change the public API hash. For example, with the items in a module file and edition 2024, changing the value of a `pub const` or a `pub static`, or a deprecation note, kept the hash, so a build system could skip compiling dependents that would see the new value.
+
+Combine the new entry hash with the current one instead.
+
+The new run-make test rewrites the source between compilations, because switching values with `cfg` attributes (as the incremental `rdr` tests do) changes the hash through the attributes alone. It fails without this change.
+---
+ .../src/rmeta/encoder/public_api_hasher.rs    |  2 +-
+ .../rdr-public-hash-changed-values/dep.rs     |  3 ++
+ .../rdr-public-hash-changed-values/m.rs       |  4 ++
+ .../rdr-public-hash-changed-values/rmake.rs   | 48 +++++++++++++++++++
+ 4 files changed, 56 insertions(+), 1 deletion(-)
+ create mode 100644 tests/run-make/rdr-public-hash-changed-values/dep.rs
+ create mode 100644 tests/run-make/rdr-public-hash-changed-values/m.rs
+ create mode 100644 tests/run-make/rdr-public-hash-changed-values/rmake.rs
+
+diff --git a/compiler/rustc_metadata/src/rmeta/encoder/public_api_hasher.rs b/compiler/rustc_metadata/src/rmeta/encoder/public_api_hasher.rs
+index c562bef90..175c151e9 100644
+--- a/compiler/rustc_metadata/src/rmeta/encoder/public_api_hasher.rs
++++ b/compiler/rustc_metadata/src/rmeta/encoder/public_api_hasher.rs
+@@ -844,7 +844,7 @@ fn add_node_hash(&mut self, node: &Node<'_>, hash: Fingerprint) {
+             Node::Predicate(_) => unimplemented!(),
+             Node::AllocId(_) => unimplemented!(),
+         };
+-        *current_hash = hash.combine_commutative(hash);
++        *current_hash = current_hash.combine_commutative(hash);
+     }
+ 
+     fn get_node(&self, node: &Node<'_>, tcx: TyCtxt<'_>) -> Option<Fingerprint> {
+diff --git a/tests/run-make/rdr-public-hash-changed-values/dep.rs b/tests/run-make/rdr-public-hash-changed-values/dep.rs
+new file mode 100644
+index 000000000..54994b6c5
+--- /dev/null
++++ b/tests/run-make/rdr-public-hash-changed-values/dep.rs
+@@ -0,0 +1,3 @@
++#![crate_type = "rlib"]
++
++pub mod m;
+diff --git a/tests/run-make/rdr-public-hash-changed-values/m.rs b/tests/run-make/rdr-public-hash-changed-values/m.rs
+new file mode 100644
+index 000000000..f538fc011
+--- /dev/null
++++ b/tests/run-make/rdr-public-hash-changed-values/m.rs
+@@ -0,0 +1,4 @@
++pub const C: u32 = 5;
++pub static S: u32 = 5;
++#[deprecated(note = "first note")]
++pub fn old() {}
+diff --git a/tests/run-make/rdr-public-hash-changed-values/rmake.rs b/tests/run-make/rdr-public-hash-changed-values/rmake.rs
+new file mode 100644
+index 000000000..7a0c116f9
+--- /dev/null
++++ b/tests/run-make/rdr-public-hash-changed-values/rmake.rs
+@@ -0,0 +1,48 @@
++// Changing what downstream crates can see of a public item, such as the value of a constant or
++// static, or a deprecation note, must change the crate's *public API hash*. The hash of an item
++// combines the hashes of all its metadata table entries, so a change in any one of them must reach
++// it.
++//
++// Like `rdr-public-hash-moved-items`, this test rewrites the source file between compilations:
++// the incremental `rdr` tests switch values with `cfg` attributes, which change the hash by
++// themselves.
++
++//@ ignore-cross-compile
++
++use run_make_support::{rfs, rustc};
++
++/// Compile `dep.rs` (and its module `m.rs`) with public api hashing, and return its public hash.
++fn compile_and_read_public_hash() -> String {
++    rustc().input("dep.rs").edition("2024").arg("-Zpublic-api-hash").run();
++    let listing = rustc().arg("-Zls=public_hash").input("libdep.rlib").run().stdout_utf8();
++    listing
++        .lines()
++        .find_map(|line| line.strip_prefix("Public hash:"))
++        .map(|hash| hash.trim().to_owned())
++        .expect("`-Zls=public_hash` did not print a `Public hash:` line")
++}
++
++/// The items are in a module file: there, the changed table entries are not the last ones encoded
++/// for their items.
++fn replace(from: &str, to: &str) {
++    let contents = rfs::read_to_string("m.rs");
++    assert!(contents.contains(from), "`{from}` not found");
++    rfs::write("m.rs", contents.replace(from, to));
++}
++
++fn main() {
++    let baseline = compile_and_read_public_hash();
++
++    replace("pub const C: u32 = 5;", "pub const C: u32 = 6;");
++    let after_const = compile_and_read_public_hash();
++    assert_ne!(baseline, after_const, "public hash did not change with the value of `C`");
++
++    replace("pub static S: u32 = 5;", "pub static S: u32 = 6;");
++    let after_static = compile_and_read_public_hash();
++    assert_ne!(after_const, after_static, "public hash did not change with the value of `S`");
++
++    // Only one table entry of `old` changes, and not the last one encoded for it.
++    replace("first note", "second note");
++    let after_note = compile_and_read_public_hash();
++    assert_ne!(after_static, after_note, "public hash did not change with the deprecation note");
++}

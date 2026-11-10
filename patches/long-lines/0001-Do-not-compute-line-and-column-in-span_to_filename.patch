@@ -1,0 +1,28 @@
+From 440621405858b8b8c8cd196f9399adfb2f4639b2 Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:46:35 +0300
+Subject: [PATCH 1/4] Do not compute line and column in `span_to_filename`
+
+`SourceMap::span_to_filename` called `lookup_char_pos`, which also computes the line, the column and the display column, and the display column walks every char from the start of the line to the position. Only the file is used.
+
+`Session::resolve_path` calls `span_to_filename` for every relative `include_bytes!`, `include_str!` and `include!`. In generated code where a whole file is one long line, each call walked up to the whole line, so the total cost was (number of calls) x (line length). `lookup_source_file` returns the same file without that work.
+
+Measured with 822182db4 on an Apple M2: a test crate with 1,511 relative `include_bytes!` on one 2.4 MB line, `expand_crate` 8.2 s before, 0.04 s with one call per line or with absolute paths. In SteelMC's `steel-registry` (17 MB of generated code), about 90% of the macro expansion samples were in this call chain.
+---
+ compiler/rustc_span/src/source_map.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/rustc_span/src/source_map.rs b/compiler/rustc_span/src/source_map.rs
+index f394765ab..33dc25446 100644
+--- a/compiler/rustc_span/src/source_map.rs
++++ b/compiler/rustc_span/src/source_map.rs
+@@ -517,7 +517,8 @@ pub fn span_to_diagnostic_string(&self, sp: Span) -> String {
+     }
+ 
+     pub fn span_to_filename(&self, sp: Span) -> FileName {
+-        self.lookup_char_pos(sp.lo()).file.name.clone()
++        // Only the file is needed: skip the line and column lookup in `lookup_char_pos`.
++        self.lookup_source_file(sp.lo()).name.clone()
+     }
+ 
+     pub fn filename_for_diagnostics<'a>(&self, filename: &'a FileName) -> FileNameDisplay<'a> {

@@ -1,0 +1,279 @@
+From 56fd7bf9ebe6051c1a03885ebf3294a3f0f6cbb9 Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:25:52 +0300
+Subject: [PATCH 5/5] Report the public API hash in the metadata artifact
+ notification
+
+A build system can skip compiling a dependent crate again when the public API hash of each of its dependencies did not change. To compare the hashes, it needs to know them without parsing the metadata format, so with `-Zpublic-api-hash` the artifact notification of the metadata file (`--json=artifacts`) now has a `public_hash` field. Cargo can read it like it already reads the notification to start dependents early.
+
+The hash is read from the header of the metadata file through a memory map, which also covers metadata reused from the incremental session directory. The field is left out without the flag, so the notification is unchanged by default.
+---
+ compiler/rustc_codegen_ssa/src/back/link.rs   |  2 +-
+ compiler/rustc_codegen_ssa/src/back/write.rs  |  4 +-
+ compiler/rustc_driver_impl/src/pretty.rs      |  2 +-
+ compiler/rustc_errors/src/emitter.rs          |  8 ++-
+ compiler/rustc_errors/src/json.rs             | 12 ++++-
+ compiler/rustc_errors/src/lib.rs              | 13 ++++-
+ compiler/rustc_interface/src/passes.rs        |  2 +-
+ compiler/rustc_metadata/src/fs.rs             | 25 +++++++++-
+ .../lib.rs                                    |  3 ++
+ .../rmake.rs                                  | 49 +++++++++++++++++++
+ 10 files changed, 109 insertions(+), 11 deletions(-)
+ create mode 100644 tests/run-make/rdr-public-hash-artifact-notification/lib.rs
+ create mode 100644 tests/run-make/rdr-public-hash-artifact-notification/rmake.rs
+
+diff --git a/compiler/rustc_codegen_ssa/src/back/link.rs b/compiler/rustc_codegen_ssa/src/back/link.rs
+index 8c6998407..2293e935d 100644
+--- a/compiler/rustc_codegen_ssa/src/back/link.rs
++++ b/compiler/rustc_codegen_ssa/src/back/link.rs
+@@ -401,7 +401,7 @@ pub fn link_binary(
+                 }
+             }
+             if sess.opts.json_artifact_notifications {
+-                sess.dcx().emit_artifact_notification(&out_filename, "link");
++                sess.dcx().emit_artifact_notification(&out_filename, "link", None);
+             }
+ 
+             if sess.prof.enabled()
+diff --git a/compiler/rustc_codegen_ssa/src/back/write.rs b/compiler/rustc_codegen_ssa/src/back/write.rs
+index 78cdd3e38..3d35a821d 100644
+--- a/compiler/rustc_codegen_ssa/src/back/write.rs
++++ b/compiler/rustc_codegen_ssa/src/back/write.rs
+@@ -667,7 +667,7 @@ pub fn produce_final_output_artifacts(
+                     // for single cgu file is renamed to drop cgu specific suffix
+                     // so we regenerate it the same way
+                     let path = crate_output.path(ty);
+-                    sess.dcx().emit_artifact_notification(path.as_path(), descr);
++                    sess.dcx().emit_artifact_notification(path.as_path(), descr, None);
+                 }
+             });
+         } else {
+@@ -675,7 +675,7 @@ pub fn produce_final_output_artifacts(
+                 module.for_each_output(|path, ty| {
+                     if sess.opts.output_types.contains_key(&ty) {
+                         let descr = ty.shorthand();
+-                        sess.dcx().emit_artifact_notification(&path, descr);
++                        sess.dcx().emit_artifact_notification(&path, descr, None);
+                     }
+                 });
+             }
+diff --git a/compiler/rustc_driver_impl/src/pretty.rs b/compiler/rustc_driver_impl/src/pretty.rs
+index 4bf1a3d87..5b2ff7c9a 100644
+--- a/compiler/rustc_driver_impl/src/pretty.rs
++++ b/compiler/rustc_driver_impl/src/pretty.rs
+@@ -357,7 +357,7 @@ pub fn emit_mir(tcx: TyCtxt<'_>) -> io::Result<()> {
+             let mut f = File::create_buffered(&path)?;
+             write_mir_pretty(tcx, &mut f)?;
+             if tcx.sess.opts.json_artifact_notifications {
+-                tcx.dcx().emit_artifact_notification(&path, "mir");
++                tcx.dcx().emit_artifact_notification(&path, "mir", None);
+             }
+         }
+     }
+diff --git a/compiler/rustc_errors/src/emitter.rs b/compiler/rustc_errors/src/emitter.rs
+index 6d5f8462f..9727d07be 100644
+--- a/compiler/rustc_errors/src/emitter.rs
++++ b/compiler/rustc_errors/src/emitter.rs
+@@ -56,7 +56,13 @@ pub trait Emitter {
+ 
+     /// Emit a notification that an artifact has been output.
+     /// Currently only supported for the JSON format.
+-    fn emit_artifact_notification(&mut self, _path: &Path, _artifact_type: &str) {}
++    fn emit_artifact_notification(
++        &mut self,
++        _path: &Path,
++        _artifact_type: &str,
++        _public_hash: Option<&str>,
++    ) {
++    }
+ 
+     /// Emit a timestamp with start/end of a timing section.
+     /// Currently only supported for the JSON format.
+diff --git a/compiler/rustc_errors/src/json.rs b/compiler/rustc_errors/src/json.rs
+index 04ac140f3..c179a08d9 100644
+--- a/compiler/rustc_errors/src/json.rs
++++ b/compiler/rustc_errors/src/json.rs
+@@ -109,8 +109,13 @@ fn emit_diagnostic(&mut self, diag: crate::DiagInner) {
+         }
+     }
+ 
+-    fn emit_artifact_notification(&mut self, path: &Path, artifact_type: &str) {
+-        let data = ArtifactNotification { artifact: path, emit: artifact_type };
++    fn emit_artifact_notification(
++        &mut self,
++        path: &Path,
++        artifact_type: &str,
++        public_hash: Option<&str>,
++    ) {
++        let data = ArtifactNotification { artifact: path, emit: artifact_type, public_hash };
+         let result = self.emit(EmitTyped::Artifact(data));
+         if let Err(e) = result {
+             panic!("failed to print notification: {e:?}");
+@@ -259,6 +264,9 @@ struct ArtifactNotification<'a> {
+     artifact: &'a Path,
+     /// What kind of artifact we're emitting.
+     emit: &'a str,
++    /// The public API hash of the crate (`-Zpublic-api-hash`), for metadata artifacts.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    public_hash: Option<&'a str>,
+ }
+ 
+ #[derive(Serialize)]
+diff --git a/compiler/rustc_errors/src/lib.rs b/compiler/rustc_errors/src/lib.rs
+index f868b11ea..34764ff76 100644
+--- a/compiler/rustc_errors/src/lib.rs
++++ b/compiler/rustc_errors/src/lib.rs
+@@ -876,8 +876,17 @@ pub fn emit_diagnostic(&self, diagnostic: DiagInner) -> Option<ErrorGuaranteed>
+         self.inner.borrow_mut().emit_diagnostic(diagnostic, self.tainted_with_errors)
+     }
+ 
+-    pub fn emit_artifact_notification(&self, path: &Path, artifact_type: &str) {
+-        self.inner.borrow_mut().emitter.emit_artifact_notification(path, artifact_type);
++    pub fn emit_artifact_notification(
++        &self,
++        path: &Path,
++        artifact_type: &str,
++        public_hash: Option<&str>,
++    ) {
++        self.inner.borrow_mut().emitter.emit_artifact_notification(
++            path,
++            artifact_type,
++            public_hash,
++        );
+     }
+ 
+     pub fn emit_timing_section_start(&self, record: TimingRecord) {
+diff --git a/compiler/rustc_interface/src/passes.rs b/compiler/rustc_interface/src/passes.rs
+index 68af06176..e257e0f3d 100644
+--- a/compiler/rustc_interface/src/passes.rs
++++ b/compiler/rustc_interface/src/passes.rs
+@@ -773,7 +773,7 @@ fn hash_iter_files<P: AsRef<Path>>(
+     match result {
+         Ok(_) => {
+             if sess.opts.json_artifact_notifications {
+-                sess.dcx().emit_artifact_notification(deps_filename, "dep-info");
++                sess.dcx().emit_artifact_notification(deps_filename, "dep-info", None);
+             }
+         }
+         Err(error) => {
+diff --git a/compiler/rustc_metadata/src/fs.rs b/compiler/rustc_metadata/src/fs.rs
+index 535197b3d..24fd6e9c2 100644
+--- a/compiler/rustc_metadata/src/fs.rs
++++ b/compiler/rustc_metadata/src/fs.rs
+@@ -1,6 +1,9 @@
++use std::ops::Deref;
+ use std::path::{Path, PathBuf};
+ use std::{fs, io};
+ 
++use rustc_data_structures::memmap::Mmap;
++use rustc_data_structures::owned_slice::slice_owned;
+ use rustc_data_structures::temp_dir::MaybeTempDir;
+ use rustc_fs_util::TempDirBuilder;
+ use rustc_middle::ty::TyCtxt;
+@@ -13,6 +16,7 @@
+     BinaryOutputToTty, FailedCopyToStdout, FailedCreateEncodedMetadata, FailedCreateFile,
+     FailedCreateTempdir, FailedWriteError,
+ };
++use crate::rmeta::MetadataBlob;
+ use crate::{EncodedMetadata, encode_metadata};
+ 
+ // FIXME(eddyb) maybe include the crate name in this?
+@@ -95,7 +99,17 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> EncodedMetadata {
+             }
+         };
+         if tcx.sess.opts.json_artifact_notifications {
+-            tcx.dcx().emit_artifact_notification(out_filename.as_path(), "metadata");
++            // Build systems can skip compiling dependents again when it did not change.
++            let public_hash = if tcx.sess.opts.unstable_opts.public_api_hash {
++                read_public_api_hash(&filename)
++            } else {
++                None
++            };
++            tcx.dcx().emit_artifact_notification(
++                out_filename.as_path(),
++                "metadata",
++                public_hash.as_deref(),
++            );
+         }
+         (filename, Some(metadata_tmpdir))
+     } else {
+@@ -112,6 +126,15 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> EncodedMetadata {
+     metadata
+ }
+ 
++/// Reads the public API hash from the header of the metadata file at `path`.
++fn read_public_api_hash(path: &Path) -> Option<String> {
++    let file = fs::File::open(path).ok()?;
++    // SAFETY: this session has just written the file, and nothing modifies it.
++    let mmap = unsafe { Mmap::map(file) }.ok()?;
++    let blob = MetadataBlob::new(slice_owned(mmap, Deref::deref)).ok()?;
++    Some(blob.get_header().hashes.public_hash.to_string())
++}
++
+ #[cfg(not(target_os = "linux"))]
+ pub fn non_durable_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
+     std::fs::rename(src, dst)
+diff --git a/tests/run-make/rdr-public-hash-artifact-notification/lib.rs b/tests/run-make/rdr-public-hash-artifact-notification/lib.rs
+new file mode 100644
+index 000000000..f099d61e0
+--- /dev/null
++++ b/tests/run-make/rdr-public-hash-artifact-notification/lib.rs
+@@ -0,0 +1,3 @@
++pub fn f() -> u32 {
++    1
++}
+diff --git a/tests/run-make/rdr-public-hash-artifact-notification/rmake.rs b/tests/run-make/rdr-public-hash-artifact-notification/rmake.rs
+new file mode 100644
+index 000000000..8f0b20481
+--- /dev/null
++++ b/tests/run-make/rdr-public-hash-artifact-notification/rmake.rs
+@@ -0,0 +1,49 @@
++//@ needs-target-std
++//
++// With `-Zpublic-api-hash`, the artifact notification of the metadata file reports the crate's
++// public API hash, so that build systems can read it without parsing the metadata. It must be the
++// hash in the metadata, also when incremental compilation reuses the saved metadata, and it is not
++// reported without the flag.
++
++use run_make_support::{cwd, rustc};
++
++/// Compiles `lib.rs` and returns the `public_hash` of its metadata artifact notification.
++fn compile(public_api_hash: bool) -> Option<String> {
++    let mut cmd = rustc();
++    cmd.input("lib.rs")
++        .crate_type("rlib")
++        .emit("metadata,link")
++        .json("artifacts")
++        .error_format("json")
++        .incremental(cwd().join("incr"));
++    if public_api_hash {
++        cmd.arg("-Zpublic-api-hash");
++    }
++    let stderr = cmd.run().stderr_utf8();
++    let notification = stderr
++        .lines()
++        .find(|line| line.contains(r#""emit":"metadata""#))
++        .expect("no artifact notification for the metadata");
++    let (_, rest) = notification.split_once(r#""public_hash":""#)?;
++    Some(rest.split('"').next().unwrap().to_owned())
++}
++
++fn public_hash_in_metadata() -> String {
++    let listing = rustc().arg("-Zls=public_hash").input("liblib.rmeta").run().stdout_utf8();
++    listing
++        .lines()
++        .find_map(|line| line.strip_prefix("Public hash:"))
++        .map(|hash| hash.trim().to_owned())
++        .expect("`-Zls=public_hash` did not print a `Public hash:` line")
++}
++
++fn main() {
++    assert_eq!(compile(false), None, "public hash reported without `-Zpublic-api-hash`");
++
++    let reported = compile(true).expect("no public hash in the notification");
++    assert_eq!(reported, public_hash_in_metadata());
++
++    // Unchanged sources: the metadata is reused from the incremental session directory.
++    let reused = compile(true).expect("no public hash in the notification of reused metadata");
++    assert_eq!(reused, reported);
++}

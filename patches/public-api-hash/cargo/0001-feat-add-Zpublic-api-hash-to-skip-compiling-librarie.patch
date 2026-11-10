@@ -1,0 +1,934 @@
+From a44012fd10b19ab362ee003a6763b95d5d22575b Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:40:10 +0300
+Subject: [PATCH] feat: add `-Zpublic-api-hash` to skip compiling libraries
+ whose dependencies did not change what they can see
+
+With `-Zpublic-api-hash`, rustc computes a hash of everything in a library's metadata that its dependents can observe, and reports it in the artifact notification of the `.rmeta` file (rust-lang/rust#156940 and follow-ups). This makes Cargo use it: when a `lib`/`rlib` unit is dirty only because some of its dependencies were compiled again, and what it can see of each dependency did not change, compiling it again would produce the same outputs. Cargo then marks its outputs as up to date instead, and replays its cached messages like for a fresh unit.
+
+What a unit sees of a dependency: the public API hash of a library; the output of a build script run (files the script writes are in the unit's dep-info); anything else, such as a proc macro, counts as changed whenever it was compiled again (output mtimes). This state is saved per unit in `public-api-hash-deps` (a JSON array), and the unit's own hash in `public-api-hash`, both in its fingerprint directory.
+
+The public API hash leaves out span positions that dependents only use in diagnostics, so a unit is still compiled again when one of its cached diagnostics points into a file that is not its own source (from its dep-info) or a toolchain file.
+
+To tell that only dependencies changed, the unit's own files are checked before its dependencies, but only with the flag: without it the order, and so the reported dirty reason, does not change.
+
+`rustc` removes the message cache of a unit when its work is prepared, so the skip check is set up before that, keeps the cache in memory, and writes it back on a skip.
+
+The new tests need a rustc that knows `-Zpublic-api-hash`, so they fail with today's nightly. They were checked by breaking the feature: never skipping fails the 3 skip tests, always skipping fails the 6 others, and dropping the diagnostics check fails only the warning test.
+---
+ doc/book/src/reference/unstable.md           |  32 ++
+ src/compiler/custom_build.rs                 |   4 +-
+ src/compiler/fingerprint/mod.rs              |  66 +++-
+ src/compiler/mod.rs                          |  29 +-
+ src/compiler/public_api_hash.rs              | 304 +++++++++++++++++++
+ src/workspace/features.rs                    |   2 +
+ tests/testsuite/cargo/z_help/stdout.term.svg |  40 +--
+ tests/testsuite/main.rs                      |   1 +
+ tests/testsuite/public_api_hash.rs           | 223 ++++++++++++++
+ 9 files changed, 672 insertions(+), 29 deletions(-)
+ create mode 100644 src/compiler/public_api_hash.rs
+ create mode 100644 tests/testsuite/public_api_hash.rs
+
+diff --git a/doc/book/src/reference/unstable.md b/doc/book/src/reference/unstable.md
+index b60e1e64..c4214184 100644
+--- a/doc/book/src/reference/unstable.md
++++ b/doc/book/src/reference/unstable.md
+@@ -89,6 +89,7 @@ Each new feature described below should explain how to use it.
+     * [build-std-features](#build-std-features) --- Sets features to use with the standard library.
+     * [binary-dep-depinfo](#binary-dep-depinfo) --- Causes the dep-info file to track binary dependencies.
+     * [checksum-freshness](#checksum-freshness) --- When passed, the decision as to whether a crate needs to be rebuilt is made using file checksums instead of the file mtime.
++    * [public-api-hash](#public-api-hash) --- Skips compiling a library again when its dependencies changed only in ways it cannot observe.
+     * [panic-abort-tests](#panic-abort-tests) --- Allows running tests with the "abort" panic strategy.
+     * [host-config](#host-config) --- Allows setting `[target]`-like configuration settings for host build targets.
+     * [embed-metadata](#embed-metadata) --- If set to `no`, cargo will pass `-Zembed-metadata=no` to the compiler, which avoid embedding metadata into rlib and dylib artifacts, to save disk space.
+@@ -635,6 +636,37 @@ Select the method used for detecting when a build should occur based on source i
+ > [!NOTE]
+ > This does not affect the build script `cargo::rerun-if-changed` directive.
+ 
++## public-api-hash
++* Tracking rustc issue: [#158844](https://github.com/rust-lang/rust/issues/158844)
++
++The `-Z public-api-hash` flag passes the same flag to `rustc`, which then reports a hash of
++everything in the metadata of a library that its dependents can observe. When a library is
++dirty only because some of its dependencies were compiled again, and none of them changed
++what the library can observe, Cargo does not compile the library again: it would produce the
++same outputs. Its outputs are marked as up to date instead, and its cached warnings are shown
++like for a fresh library.
++
++For example, a change to the body of a non-generic, non-inline function in one crate no
++longer compiles all the crates that depend on it again; only the crates that link it, such
++as binaries and tests, are linked again.
++
++What a library can observe of a dependency is:
++
++* for a library compiled with `-Z public-api-hash`: its public API hash;
++* for a build script run: its output. Files that the build script writes are tracked like
++  the library's own source files;
++* for anything else, for example a proc macro: whether it was compiled again.
++
++Only crates of type `lib` and `rlib` are skipped. A library with cached diagnostics is
++compiled again when one of them points into a file of another crate, because the public API
++hash leaves out the positions that dependents only use in diagnostics.
++
++```toml
++# .cargo/config.toml
++[unstable]
++public-api-hash = true
++```
++
+ ## panic-abort-tests
+ * Tracking Issue: [#67650](https://github.com/rust-lang/rust/issues/67650)
+ * Original Pull Request: [#7460](https://github.com/rust-lang/cargo/pull/7460)
+diff --git a/src/compiler/custom_build.rs b/src/compiler/custom_build.rs
+index c6754896..b8f9cfee 100644
+--- a/src/compiler/custom_build.rs
++++ b/src/compiler/custom_build.rs
+@@ -1452,11 +1452,11 @@ impl BuildScriptOutputs {
+ }
+ 
+ /// Files with information about a running build script.
+-struct BuildScriptRunFiles {
++pub(crate) struct BuildScriptRunFiles {
+     /// The directory containing files related to running a build script.
+     root: PathBuf,
+     /// The stdout produced by the build script
+-    stdout: PathBuf,
++    pub(crate) stdout: PathBuf,
+     /// The stderr produced by the build script
+     stderr: PathBuf,
+     /// A file that contains the path to the `out` dir of the build script.
+diff --git a/src/compiler/fingerprint/mod.rs b/src/compiler/fingerprint/mod.rs
+index ebaa5c34..f0a4dd41 100644
+--- a/src/compiler/fingerprint/mod.rs
++++ b/src/compiler/fingerprint/mod.rs
+@@ -1252,6 +1252,31 @@ impl Fingerprint {
+     /// dependencies up to this unit as well. This function assumes that the
+     /// unit starts out as [`FsStatus::Stale`] and then it will optionally switch
+     /// it to `UpToDate` if it can.
++    /// Returns the first stale item of the package itself, from its `LocalFingerprint`s.
++    fn find_stale_local_item(
++        &mut self,
++        mtime_cache: &mut HashMap<PathBuf, FileTime>,
++        checksum_cache: &mut HashMap<PathBuf, Checksum>,
++        pkg: &Package,
++        build_root: &Path,
++        cargo_exe: &Path,
++        gctx: &GlobalContext,
++    ) -> CargoResult<Option<StaleItem>> {
++        for local in self.local.get_mut().unwrap().iter() {
++            if let Some(item) = local.find_stale_item(
++                mtime_cache,
++                checksum_cache,
++                pkg,
++                build_root,
++                cargo_exe,
++                gctx,
++            )? {
++                return Ok(Some(item));
++            }
++        }
++        Ok(None)
++    }
++
+     fn check_filesystem(
+         &mut self,
+         mtime_cache: &mut HashMap<PathBuf, FileTime>,
+@@ -1296,6 +1321,26 @@ impl Fingerprint {
+             pkg_root, max_path, max_mtime
+         );
+ 
++        // With `-Zpublic-api-hash`, the package's own files are checked before its
++        // dependencies, so that a stale dependency also means that its own files are up to
++        // date: then the unit may not need to be compiled again. Without it, the dependencies
++        // come first, as they always did, which keeps the reported reason.
++        let own_files_first = gctx.cli_unstable().public_api_hash;
++        if own_files_first
++            && let Some(item) = self.find_stale_local_item(
++                mtime_cache,
++                checksum_cache,
++                pkg,
++                build_root,
++                cargo_exe,
++                gctx,
++            )?
++        {
++            item.log();
++            self.fs_status = FsStatus::StaleItem(item);
++            return Ok(());
++        }
++
+         for dep in self.deps.iter() {
+             let dep_mtimes = match &dep.fingerprint.fs_status {
+                 FsStatus::UpToDate { mtimes } => mtimes,
+@@ -1361,19 +1406,19 @@ impl Fingerprint {
+         // all our `LocalFingerprint` information to see if we have any stale
+         // files for this package itself. If we do find something log a helpful
+         // message and bail out so we stay stale.
+-        for local in self.local.get_mut().unwrap().iter() {
+-            if let Some(item) = local.find_stale_item(
++        if !own_files_first
++            && let Some(item) = self.find_stale_local_item(
+                 mtime_cache,
+                 checksum_cache,
+                 pkg,
+                 build_root,
+                 cargo_exe,
+                 gctx,
+-            )? {
+-                item.log();
+-                self.fs_status = FsStatus::StaleItem(item);
+-                return Ok(());
+-            }
++            )?
++        {
++            item.log();
++            self.fs_status = FsStatus::StaleItem(item);
++            return Ok(());
+         }
+ 
+         // Everything was up to date! Record such.
+@@ -1691,6 +1736,13 @@ fn calculate_normal(
+         && build_runner.unit_deps(unit).iter().any(|dep| !dep.public)
+         && super::is_public_dependency_enabled(build_runner, unit))
+     .hash(&mut config);
++    // -Zpublic-api-hash adds the public API hash to the metadata of libraries.
++    build_runner
++        .bcx
++        .gctx
++        .cli_unstable()
++        .public_api_hash
++        .hash(&mut config);
+     // -Zembed-metadata changes how all units are compiled, and it also changes how we tell
+     // rustc to link to deps using `--extern`. If it changes, we should rebuild everything.
+     build_runner
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index d13f9227..2da6445e 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -45,6 +45,7 @@ mod locking;
+ mod lto;
+ mod output_depinfo;
+ mod output_sbom;
++mod public_api_hash;
+ pub mod rustdoc;
+ pub mod standard_lib;
+ pub mod timings;
+@@ -241,7 +242,14 @@ fn compile<'gctx>(
+                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+                     rustdoc(build_runner, unit)?
+                 } else {
+-                    rustc(build_runner, unit, exec)?
++                    // Must come before `rustc`, which removes the message cache of the unit.
++                    let skip =
++                        public_api_hash::SkipIfUnchanged::new(build_runner, unit, job.freshness())?;
++                    let work = rustc(build_runner, unit, exec)?;
++                    match skip {
++                        Some(skip) => skip.wrap(work),
++                        None => work,
++                    }
+                 };
+                 work.then(link_targets(build_runner, unit, false)?)
+             } else {
+@@ -866,6 +874,9 @@ fn prepare_rustc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
+     if gctx.cli_unstable().binary_dep_depinfo {
+         base.arg("-Z").arg("binary-dep-depinfo");
+     }
++    if gctx.cli_unstable().public_api_hash {
++        base.arg("-Z").arg("public-api-hash");
++    }
+     if build_runner.bcx.gctx.cli_unstable().checksum_freshness {
+         match build_runner
+             .bcx
+@@ -2036,6 +2047,8 @@ struct OutputOptions {
+     warnings_seen: usize,
+     /// Tracks the number of errors we've seen so far.
+     errors_seen: usize,
++    /// Where to save the public API hash that rustc reports with `-Zpublic-api-hash`.
++    public_api_hash_path: Option<PathBuf>,
+ }
+ 
+ impl OutputOptions {
+@@ -2055,6 +2068,12 @@ impl OutputOptions {
+             show_diagnostics,
+             warnings_seen: 0,
+             errors_seen: 0,
++            public_api_hash_path: build_runner
++                .bcx
++                .gctx
++                .cli_unstable()
++                .public_api_hash
++                .then(|| public_api_hash::public_api_hash_path(build_runner, unit)),
+         }
+     }
+ 
+@@ -2073,6 +2092,7 @@ impl OutputOptions {
+             show_diagnostics,
+             warnings_seen: 0,
+             errors_seen: 0,
++            public_api_hash_path: None,
+         }
+     }
+ }
+@@ -2376,12 +2396,19 @@ fn on_stderr_line_inner(
+     struct ArtifactNotification<'a> {
+         #[serde(borrow)]
+         artifact: Cow<'a, str>,
++        /// Reported for metadata with `-Zpublic-api-hash`.
++        #[serde(borrow, default)]
++        public_hash: Option<Cow<'a, str>>,
+     }
+ 
+     if let Ok(artifact) = serde_json::from_str::<ArtifactNotification<'_>>(compiler_message.get()) {
+         trace!("found directive from rustc: `{}`", artifact.artifact);
+         if artifact.artifact.ends_with(".rmeta") {
+             debug!("looks like metadata finished early!");
++            if let (Some(hash), Some(path)) = (&artifact.public_hash, &options.public_api_hash_path)
++            {
++                paths::write(path, hash.as_bytes())?;
++            }
+             state.rmeta_produced();
+         }
+         return Ok(false);
+diff --git a/src/compiler/public_api_hash.rs b/src/compiler/public_api_hash.rs
+new file mode 100644
+index 00000000..4172695f
+--- /dev/null
++++ b/src/compiler/public_api_hash.rs
+@@ -0,0 +1,304 @@
++//! Skips the compilation of libraries whose dependencies changed only in ways that the
++//! library cannot observe (`-Zpublic-api-hash`).
++//!
++//! With `-Zpublic-api-hash`, rustc computes a hash of everything in the metadata of a library
++//! that its dependents can observe, and reports it in the artifact notification of the
++//! metadata file. Cargo saves it in the [`PUBLIC_API_HASH`] file of the unit.
++//!
++//! When a library is dirty only because some of its dependencies were compiled again, Cargo
++//! compares what the library sees of each dependency now with what it saw when it was last
++//! compiled, which is saved in the [`DEP_VIEWS`] file. If nothing changed,
++//! compiling the library again would produce the same outputs, so Cargo marks its outputs as
++//! up to date instead, and replays its cached messages like for a fresh unit. Its own
++//! dependents then go through the same check.
++//!
++//! What a unit sees of a dependency is:
++//!
++//! - for a library compiled with `-Zpublic-api-hash`: its public API hash;
++//! - for a build script run: its output, which can set flags and environment variables. Files
++//!   that the build script writes are tracked in the dep-info of the unit, like its own source
++//!   files;
++//! - for anything else (for example a proc macro): the modification times of its outputs, so
++//!   that a dependency which was compiled again is always seen as changed.
++//!
++//! Only `lib` and `rlib` crates are skipped: other crate types link their dependencies into
++//! their outputs.
++
++use std::fs;
++use std::path::PathBuf;
++
++use cargo_util::paths;
++use serde_json::Value;
++
++use crate::compiler::build_runner::BuildRunner;
++use crate::compiler::custom_build::BuildScriptRunFiles;
++use crate::compiler::fingerprint::{self, DirtyReason, FsStatus};
++use crate::compiler::job_queue::{Freshness, Work};
++use crate::compiler::{CompileMode, CrateType, Unit};
++use crate::util::errors::CargoResult;
++use crate::util::path_args;
++use crate::workspace::PackageId;
++
++/// The public API hash of a library, as reported by rustc.
++pub const PUBLIC_API_HASH: &str = "public-api-hash";
++
++/// What a library saw of each of its dependencies when it was last compiled, as a JSON array
++/// with one string per dependency.
++pub const DEP_VIEWS: &str = "public-api-hash-deps";
++
++/// The path where the public API hash that rustc reports for `unit` is saved.
++pub fn public_api_hash_path(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> PathBuf {
++    build_runner
++        .files()
++        .fingerprint_dir(unit)
++        .join(PUBLIC_API_HASH)
++}
++
++/// Skips the work that compiles a unit when only its dependencies changed, and none of them
++/// in a way that the unit can observe.
++pub struct SkipIfUnchanged {
++    package_id: PackageId,
++    may_skip: bool,
++    deps: Vec<DepView>,
++    outputs: Vec<PathBuf>,
++    /// Where rustc's report of the unit's own public API hash is saved.
++    public_api_hash: PathBuf,
++    /// Where what the unit saw of its dependencies when it was last compiled is saved.
++    dep_views: PathBuf,
++    cache_path: PathBuf,
++    /// The message cache of the unit, which preparing its work removes.
++    cache: Option<String>,
++    replay: Work,
++}
++
++impl SkipIfUnchanged {
++    /// Returns `None` without `-Zpublic-api-hash`.
++    ///
++    /// Must be called before the work that compiles `unit` is prepared: preparing it removes
++    /// the message cache of the unit, which a skipped unit still needs.
++    pub fn new(
++        build_runner: &BuildRunner<'_, '_>,
++        unit: &Unit,
++        freshness: &Freshness,
++    ) -> CargoResult<Option<Self>> {
++        if !build_runner.bcx.gctx.cli_unstable().public_api_hash {
++            return Ok(None);
++        }
++        let files = build_runner.files();
++        let deps = build_runner
++            .unit_deps(unit)
++            .iter()
++            .map(|dep| {
++                let view = if dep.unit.mode.is_run_custom_build() {
++                    BuildScriptRunFiles::for_unit(build_runner, &dep.unit).stdout
++                } else {
++                    public_api_hash_path(build_runner, &dep.unit)
++                };
++                Ok(DepView {
++                    view,
++                    outputs: output_paths(build_runner, &dep.unit)?,
++                })
++            })
++            .collect::<CargoResult<Vec<_>>>()?;
++        let cache_path = files.message_cache_path(unit);
++        let cache = fs::read_to_string(&cache_path).ok();
++        let may_skip = only_dependencies_changed(freshness)
++            && is_rlib(unit)
++            && match &cache {
++                Some(cache) => cached_diagnostics_are_current(build_runner, unit, cache)?,
++                None => true,
++            };
++        let replay = super::replay_output_cache(
++            unit.pkg.package_id(),
++            super::ManifestErrorContext::new(build_runner, unit),
++            &unit.target,
++            cache_path.clone(),
++            super::OutputOptions::for_fresh(build_runner, unit),
++        );
++        Ok(Some(SkipIfUnchanged {
++            package_id: unit.pkg.package_id(),
++            may_skip,
++            deps,
++            outputs: output_paths(build_runner, unit)?,
++            public_api_hash: public_api_hash_path(build_runner, unit),
++            dep_views: files.fingerprint_dir(unit).join(DEP_VIEWS),
++            cache_path,
++            cache,
++            replay,
++        }))
++    }
++
++    /// Wraps `work`, which compiles the unit.
++    pub fn wrap(self, work: Work) -> Work {
++        Work::new(move |state| {
++            // The dependencies have been compiled by now, so what they show is current.
++            let current = self
++                .deps
++                .iter()
++                .map(DepView::read)
++                .collect::<Option<Vec<_>>>()
++                .map(|views| serde_json::to_string(&views))
++                .transpose()?;
++            if self.may_skip
++                && current.is_some()
++                && current == fs::read_to_string(&self.dep_views).ok()
++            {
++                tracing::debug!(
++                    "skipping {}: no dependency changed in a way it can observe",
++                    self.package_id
++                );
++                let now = filetime::FileTime::now();
++                for output in &self.outputs {
++                    paths::set_file_time_no_err(output, now);
++                }
++                if let Some(cache) = &self.cache {
++                    paths::write(&self.cache_path, cache)?;
++                }
++                return self.replay.call(state);
++            }
++            // rustc reports a new hash, if the unit has one.
++            let _ = fs::remove_file(&self.public_api_hash);
++            match current {
++                Some(views) => paths::write(&self.dep_views, views)?,
++                None => {
++                    let _ = fs::remove_file(&self.dep_views);
++                }
++            }
++            work.call(state)
++        })
++    }
++}
++
++fn output_paths(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<Vec<PathBuf>> {
++    Ok(build_runner
++        .outputs(unit)?
++        .iter()
++        .map(|o| o.path.clone())
++        .collect())
++}
++
++/// What a unit sees of one of its dependencies, see the module documentation.
++struct DepView {
++    /// The public API hash of the dependency, or the output of a build script run.
++    view: PathBuf,
++    /// Outputs of the dependency, whose modification times stand in for `view` when it does
++    /// not exist.
++    outputs: Vec<PathBuf>,
++}
++
++impl DepView {
++    fn read(&self) -> Option<String> {
++        fs::read_to_string(&self.view).ok().or_else(|| {
++            // Some outputs are optional, for example split debug info.
++            let mtimes: Vec<_> = self
++                .outputs
++                .iter()
++                .filter_map(|o| paths::mtime(o).ok())
++                .collect();
++            (!mtimes.is_empty()).then(|| format!("{mtimes:?}"))
++        })
++    }
++}
++
++/// Whether the unit is dirty only because a dependency changed. With `-Zpublic-api-hash`, the
++/// unit's own files are checked before its dependencies, so a stale dependency means that they
++/// are up to date.
++fn only_dependencies_changed(freshness: &Freshness) -> bool {
++    matches!(
++        freshness,
++        Freshness::Dirty(DirtyReason::FsStatusOutdated(
++            FsStatus::StaleDepFingerprint { .. } | FsStatus::StaleDependency { .. }
++        ))
++    )
++}
++
++/// Whether the outputs of the unit contain nothing of its dependencies but their metadata.
++fn is_rlib(unit: &Unit) -> bool {
++    (unit.mode == CompileMode::Build || unit.mode.is_check())
++        && unit.target.is_lib()
++        && unit
++            .target
++            .rustc_crate_types()
++            .iter()
++            .all(|t| matches!(t, CrateType::Lib | CrateType::Rlib))
++}
++
++/// Whether the cached diagnostics of `unit` (the content of its message cache) are the ones
++/// that compiling it again would produce. The public API hash of a dependency leaves out
++/// positions that dependents only use in diagnostics, so a diagnostic that points into a
++/// dependency could be out of date. Every file that a diagnostic points to, in its spans, the
++/// spans of its children, and macro expansions, must therefore be one of the unit's own source
++/// files, which are up to date, or a file of the toolchain.
++///
++/// This is conservative: a file that cannot be placed, or a cache or dep-info that cannot be
++/// read, means that the unit is compiled again.
++fn cached_diagnostics_are_current(
++    build_runner: &BuildRunner<'_, '_>,
++    unit: &Unit,
++    cache: &str,
++) -> CargoResult<bool> {
++    if !cache.contains(r#""$message_type":"diagnostic""#) {
++        return Ok(true);
++    }
++    let build_root = build_runner.bcx.ws.build_dir().into_path_unlocked();
++    let dep_info_path = build_runner.files().fingerprint_file_path(unit, "dep-");
++    let Some(dep_info) = fingerprint::parse_dep_info(unit.pkg.root(), &build_root, &dep_info_path)?
++    else {
++        return Ok(false);
++    };
++    // rustc writes file names relative to its working directory.
++    let cwd = path_args(build_runner.bcx.ws, unit).1;
++    let sysroot = &build_runner.bcx.target_data.info(unit.kind).sysroot;
++    let is_current = |file_name: &str| {
++        let path = cwd.join(file_name);
++        // `/rustc/<commit hash>/` is the remapped path of the standard library sources.
++        dep_info.files.contains_key(&path)
++            || path.starts_with(sysroot)
++            || file_name.starts_with("/rustc/")
++    };
++    for line in cache.lines() {
++        let Ok(message) = serde_json::from_str::<Value>(line) else {
++            return Ok(false);
++        };
++        let is_diagnostic =
++            message.get("$message_type").and_then(Value::as_str) == Some("diagnostic");
++        if is_diagnostic && !all_file_names(&message, &is_current) {
++            return Ok(false);
++        }
++    }
++    Ok(true)
++}
++
++/// Whether `f` holds for every `file_name` string anywhere in `value`.
++fn all_file_names(value: &Value, f: &impl Fn(&str) -> bool) -> bool {
++    match value {
++        Value::Object(map) => map.iter().all(|(key, value)| match (key.as_str(), value) {
++            ("file_name", Value::String(name)) => f(name),
++            _ => all_file_names(value, f),
++        }),
++        Value::Array(items) => items.iter().all(|item| all_file_names(item, f)),
++        _ => true,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::all_file_names;
++
++    #[test]
++    fn file_names_in_children_and_expansions() {
++        let message = serde_json::json!({
++            "$message_type": "diagnostic",
++            "spans": [{
++                "file_name": "src/lib.rs",
++                "expansion": { "span": { "file_name": "src/lib.rs" }, "def_site_span": { "file_name": "../dep/src/lib.rs" } }
++            }],
++            "children": [{ "spans": [{ "file_name": "src/lib.rs" }] }]
++        });
++        assert!(all_file_names(&message, &|name| name.ends_with(".rs")));
++        assert!(!all_file_names(&message, &|name| name == "src/lib.rs"));
++        assert!(all_file_names(&serde_json::json!({ "spans": [] }), &|_| {
++            false
++        }));
++    }
++}
+diff --git a/src/workspace/features.rs b/src/workspace/features.rs
+index 894fc19c..32a15237 100644
+--- a/src/workspace/features.rs
++++ b/src/workspace/features.rs
+@@ -919,6 +919,7 @@ unstable_cli_options!(
+     prerelease: bool = ("Allow selecting pre-release versions with `update --precise`"),
+     profile_hint_mostly_unused: bool = ("Enable the `hint-mostly-unused` setting in profiles to mark a crate as mostly unused."),
+     profile_rustflags: bool = ("Enable the `rustflags` option in profiles in .cargo/config.toml file"),
++    public_api_hash: bool = ("Skip compiling a library again when its dependencies changed only in ways it cannot observe"),
+     public_dependency: bool = ("Respect a dependency's `public` field in Cargo.toml to control public/private dependencies"),
+     publish_timeout: bool = ("Enable the `publish.timeout` key in .cargo/config.toml file"),
+     root_dir: Option<PathBuf> = ("Set the root directory relative to which paths are printed (defaults to workspace root)"),
+@@ -1459,6 +1460,7 @@ impl CliUnstable {
+             "no-index-update" => self.no_index_update = parse_empty(k, v)?,
+             "panic-abort-tests" => self.panic_abort_tests = parse_empty(k, v)?,
+             "prerelease" => self.prerelease = parse_empty(k, v)?,
++            "public-api-hash" => self.public_api_hash = parse_empty(k, v)?,
+             "public-dependency" => self.public_dependency = parse_empty(k, v)?,
+             "profile-hint-mostly-unused" => self.profile_hint_mostly_unused = parse_empty(k, v)?,
+             "profile-rustflags" => self.profile_rustflags = parse_empty(k, v)?,
+diff --git a/tests/testsuite/cargo/z_help/stdout.term.svg b/tests/testsuite/cargo/z_help/stdout.term.svg
+index 462ed15d..c5bb9d34 100644
+--- a/tests/testsuite/cargo/z_help/stdout.term.svg
++++ b/tests/testsuite/cargo/z_help/stdout.term.svg
+@@ -1,4 +1,4 @@
+-<svg width="1255px" height="992px" xmlns="http://www.w3.org/2000/svg">
++<svg width="1255px" height="1010px" xmlns="http://www.w3.org/2000/svg">
+   <style>
+     .fg { fill: #AAAAAA }
+     .bg { fill: #000000 }
+@@ -88,41 +88,43 @@
+ </tspan>
+     <tspan x="10px" y="658px"><tspan>    -Z profile-rustflags           Enable the `rustflags` option in profiles in .cargo/config.toml file</tspan>
+ </tspan>
+-    <tspan x="10px" y="676px"><tspan>    -Z public-dependency           Respect a dependency's `public` field in Cargo.toml to control public/private dependencies</tspan>
++    <tspan x="10px" y="676px"><tspan>    -Z public-api-hash             Skip compiling a library again when its dependencies changed only in ways it cannot observe</tspan>
+ </tspan>
+-    <tspan x="10px" y="694px"><tspan>    -Z publish-timeout             Enable the `publish.timeout` key in .cargo/config.toml file</tspan>
++    <tspan x="10px" y="694px"><tspan>    -Z public-dependency           Respect a dependency's `public` field in Cargo.toml to control public/private dependencies</tspan>
+ </tspan>
+-    <tspan x="10px" y="712px"><tspan>    -Z root-dir                    Set the root directory relative to which paths are printed (defaults to workspace root)</tspan>
++    <tspan x="10px" y="712px"><tspan>    -Z publish-timeout             Enable the `publish.timeout` key in .cargo/config.toml file</tspan>
+ </tspan>
+-    <tspan x="10px" y="730px"><tspan>    -Z rustc-unicode               Enable `rustc`'s unicode error format in Cargo's error messages</tspan>
++    <tspan x="10px" y="730px"><tspan>    -Z root-dir                    Set the root directory relative to which paths are printed (defaults to workspace root)</tspan>
+ </tspan>
+-    <tspan x="10px" y="748px"><tspan>    -Z rustdoc-depinfo             Use dep-info files in rustdoc rebuild detection</tspan>
++    <tspan x="10px" y="748px"><tspan>    -Z rustc-unicode               Enable `rustc`'s unicode error format in Cargo's error messages</tspan>
+ </tspan>
+-    <tspan x="10px" y="766px"><tspan>    -Z rustdoc-map                 Allow passing external documentation mappings to rustdoc</tspan>
++    <tspan x="10px" y="766px"><tspan>    -Z rustdoc-depinfo             Use dep-info files in rustdoc rebuild detection</tspan>
+ </tspan>
+-    <tspan x="10px" y="784px"><tspan>    -Z rustdoc-mergeable-info      Use rustdoc mergeable cross-crate-info files</tspan>
++    <tspan x="10px" y="784px"><tspan>    -Z rustdoc-map                 Allow passing external documentation mappings to rustdoc</tspan>
+ </tspan>
+-    <tspan x="10px" y="802px"><tspan>    -Z rustdoc-scrape-examples     Allows Rustdoc to scrape code examples from reverse-dependencies</tspan>
++    <tspan x="10px" y="802px"><tspan>    -Z rustdoc-mergeable-info      Use rustdoc mergeable cross-crate-info files</tspan>
+ </tspan>
+-    <tspan x="10px" y="820px"><tspan>    -Z sbom                        Enable the `sbom` option in build config in .cargo/config.toml file</tspan>
++    <tspan x="10px" y="820px"><tspan>    -Z rustdoc-scrape-examples     Allows Rustdoc to scrape code examples from reverse-dependencies</tspan>
+ </tspan>
+-    <tspan x="10px" y="838px"><tspan>    -Z script                      Enable support for single-file, `.rs` packages</tspan>
++    <tspan x="10px" y="838px"><tspan>    -Z sbom                        Enable the `sbom` option in build config in .cargo/config.toml file</tspan>
+ </tspan>
+-    <tspan x="10px" y="856px"><tspan>    -Z section-timings             Enable support for extended compilation sections in --timings output</tspan>
++    <tspan x="10px" y="856px"><tspan>    -Z script                      Enable support for single-file, `.rs` packages</tspan>
+ </tspan>
+-    <tspan x="10px" y="874px"><tspan>    -Z target-applies-to-host      Enable the `target-applies-to-host` key in the .cargo/config.toml file</tspan>
++    <tspan x="10px" y="874px"><tspan>    -Z section-timings             Enable support for extended compilation sections in --timings output</tspan>
+ </tspan>
+-    <tspan x="10px" y="892px"><tspan>    -Z unstable-options            Allow the usage of unstable options</tspan>
++    <tspan x="10px" y="892px"><tspan>    -Z target-applies-to-host      Enable the `target-applies-to-host` key in the .cargo/config.toml file</tspan>
+ </tspan>
+-    <tspan x="10px" y="910px">
++    <tspan x="10px" y="910px"><tspan>    -Z unstable-options            Allow the usage of unstable options</tspan>
+ </tspan>
+-    <tspan x="10px" y="928px"><tspan>Run with `cargo -Z [FLAG] [COMMAND]`</tspan>
++    <tspan x="10px" y="928px">
+ </tspan>
+-    <tspan x="10px" y="946px">
++    <tspan x="10px" y="946px"><tspan>Run with `cargo -Z [FLAG] [COMMAND]`</tspan>
+ </tspan>
+-    <tspan x="10px" y="964px"><tspan>See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information about these flags.</tspan>
++    <tspan x="10px" y="964px">
+ </tspan>
+-    <tspan x="10px" y="982px">
++    <tspan x="10px" y="982px"><tspan>See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information about these flags.</tspan>
++</tspan>
++    <tspan x="10px" y="1000px">
+ </tspan>
+   </text>
+ 
+diff --git a/tests/testsuite/main.rs b/tests/testsuite/main.rs
+index c7304273..b4453695 100644
+--- a/tests/testsuite/main.rs
++++ b/tests/testsuite/main.rs
+@@ -166,6 +166,7 @@ mod profile_targets;
+ mod profile_trim_paths;
+ mod progress;
+ mod pub_priv;
++mod public_api_hash;
+ mod publish;
+ mod publish_lockfile;
+ mod read_manifest;
+diff --git a/tests/testsuite/public_api_hash.rs b/tests/testsuite/public_api_hash.rs
+new file mode 100644
+index 00000000..cd6b080c
+--- /dev/null
++++ b/tests/testsuite/public_api_hash.rs
+@@ -0,0 +1,223 @@
++//! Tests for `-Zpublic-api-hash`, which skips compiling a library again when its
++//! dependencies changed only in ways it cannot observe.
++
++use crate::prelude::*;
++use cargo_test_support::{Project, basic_manifest, project, str};
++
++/// A workspace where `foo` (a library and a binary) depends on the library `bar`.
++fn foo_and_bar(foo_lib: &str, bar_lib: &str) -> Project {
++    project()
++        .file(
++            "Cargo.toml",
++            r#"
++                [package]
++                name = "foo"
++                version = "0.0.1"
++                edition = "2015"
++
++                [dependencies]
++                bar = { path = "bar" }
++            "#,
++        )
++        .file("src/lib.rs", foo_lib)
++        .file("src/main.rs", "fn main() { println!(\"{}\", foo::get()); }")
++        .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
++        .file("bar/src/lib.rs", bar_lib)
++        .build()
++}
++
++fn build(p: &Project) -> cargo_test_support::Execs {
++    let mut execs = p.cargo("build -v -Zpublic-api-hash");
++    execs.masquerade_as_nightly_cargo(&["public-api-hash"]);
++    execs
++}
++
++#[cargo_test]
++fn requires_nightly() {
++    let p = project().file("src/lib.rs", "").build();
++    p.cargo("build -Zpublic-api-hash")
++        .with_stderr_data(str![[r#"
++[ERROR] the `-Z` flag is only accepted on the nightly channel of Cargo, but this is the `stable` channel
++See https://doc.rust-lang.org/book/appendix-07-nightly-rust.html for more information about Rust release channels.
++
++"#]])
++        .with_status(101)
++        .run();
++}
++
++#[cargo_test(nightly, reason = "-Zpublic-api-hash is unstable")]
++fn body_change_skips_dependent_library() {
++    let p = foo_and_bar(
++        "pub fn get() -> u32 { bar::value() }",
++        "pub fn value() -> u32 { 1 }",
++    );
++    build(&p).run();
++
++    p.change_file("bar/src/lib.rs", "pub fn value() -> u32 { 2 }");
++    build(&p)
++        .with_stderr_contains("[RUNNING] `rustc --crate-name bar [..]")
++        .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..]--crate-type bin [..]")
++        .with_stderr_does_not_contain("[RUNNING] `rustc --crate-name foo [..]--crate-type lib [..]")
++        .run();
++    p.process(&p.bin("foo"))
++        .with_stdout_data(str![[r#"
++2
++
++"#]])
++        .run();
++
++    // The skipped library is fresh afterwards.
++    build(&p)
++        .with_stderr_contains("[FRESH] foo v0.0.1 ([ROOT]/foo)")
++        .with_stderr_does_not_contain("[RUNNING] `rustc [..]")
++        .run();
++}
++
++#[cargo_test(nightly, reason = "-Zpublic-api-hash is unstable")]
++fn moved_item_skips_dependent_library() {
++    let p = foo_and_bar(
++        "pub fn get() -> u32 { bar::value() }",
++        "pub fn value() -> u32 { 1 }",
++    );
++    build(&p).run();
++
++    p.change_file("bar/src/lib.rs", "\n\npub fn value() -> u32 { 1 }");
++    build(&p)
++        .with_stderr_contains("[RUNNING] `rustc --crate-name bar [..]")
++        .with_stderr_does_not_contain("[RUNNING] `rustc --crate-name foo [..]--crate-type lib [..]")
++        .run();
++}
++
++#[cargo_test(nightly, reason = "-Zpublic-api-hash is unstable")]
++fn public_api_change_compiles_dependent_library() {
++    let p = foo_and_bar(
++        "pub fn get() -> u32 { bar::value() }",
++        "pub fn value() -> u32 { 1 }",
++    );
++    build(&p).run();
++
++    // Generic and inline functions are part of the public API: dependents compile them.
++    p.change_file("bar/src/lib.rs", "#[inline] pub fn value() -> u32 { 1 }");
++    build(&p)
++        .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..]--crate-type lib [..]")
++        .run();
++
++    p.change_file("bar/src/lib.rs", "#[inline] pub fn value() -> u32 { 3 }");
++    build(&p)
++        .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..]--crate-type lib [..]")
++        .run();
++    p.process(&p.bin("foo"))
++        .with_stdout_data(str![[r#"
++3
++
++"#]])
++        .run();
++}
++
++#[cargo_test(nightly, reason = "-Zpublic-api-hash is unstable")]
++fn without_flag_compiles_dependent_library() {
++    let p = foo_and_bar(
++        "pub fn get() -> u32 { bar::value() }",
++        "pub fn value() -> u32 { 1 }",
++    );
++    p.cargo("build -v").run();
++
++    p.change_file("bar/src/lib.rs", "pub fn value() -> u32 { 2 }");
++    p.cargo("build -v")
++        .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..]--crate-type lib [..]")
++        .run();
++}
++
++#[cargo_test(nightly, reason = "-Zpublic-api-hash is unstable")]
++fn skipped_library_shows_its_cached_warnings() {
++    let p = foo_and_bar(
++        "pub fn get() -> u32 { let unused = 1; bar::value() }",
++        "pub fn value() -> u32 { 1 }",
++    );
++    build(&p).run();
++
++    p.change_file("bar/src/lib.rs", "pub fn value() -> u32 { 2 }");
++    build(&p)
++        .with_stderr_does_not_contain("[RUNNING] `rustc --crate-name foo [..]--crate-type lib [..]")
++        .with_stderr_contains("[WARNING] unused variable: `unused`")
++        .run();
++    // The cached warnings are kept for the next build.
++    build(&p)
++        .with_stderr_contains("[WARNING] unused variable: `unused`")
++        .run();
++}
++
++#[cargo_test(nightly, reason = "-Zpublic-api-hash is unstable")]
++fn warning_pointing_into_dependency_compiles_dependent_library() {
++    // The deprecation warning in `foo` comes from a macro defined in `bar`, so it points into
++    // `bar`, whose positions the public API hash leaves out.
++    let p = foo_and_bar(
++        "pub fn get() -> u32 { bar::call_old!() }",
++        r#"
++            #[macro_export]
++            macro_rules! call_old { () => { $crate::old() }; }
++            #[deprecated]
++            pub fn old() -> u32 { 1 }
++            pub fn other() -> u32 { 1 }
++        "#,
++    );
++    build(&p)
++        .with_stderr_contains("[WARNING] use of deprecated function `bar::old`")
++        .run();
++
++    p.change_file(
++        "bar/src/lib.rs",
++        r#"
++            #[macro_export]
++            macro_rules! call_old { () => { $crate::old() }; }
++            #[deprecated]
++            pub fn old() -> u32 { 1 }
++            pub fn other() -> u32 { 2 }
++        "#,
++    );
++    build(&p)
++        .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..]--crate-type lib [..]")
++        .with_stderr_contains("[WARNING] use of deprecated function `bar::old`")
++        .run();
++}
++
++#[cargo_test(nightly, reason = "-Zpublic-api-hash is unstable")]
++fn build_script_output_change_compiles_dependent_library() {
++    let p = project()
++        .file(
++            "Cargo.toml",
++            r#"
++                [package]
++                name = "foo"
++                version = "0.0.1"
++                edition = "2015"
++                build = "build.rs"
++
++                [dependencies]
++                bar = { path = "bar" }
++            "#,
++        )
++        .file(
++            "src/lib.rs",
++            "pub fn get() -> &'static str { env!(\"FOO_VALUE\") }",
++        )
++        .file(
++            "build.rs",
++            r#"
++                fn main() {
++                    println!("cargo::rerun-if-env-changed=FOO_VALUE_SOURCE");
++                    let value = std::env::var("FOO_VALUE_SOURCE").unwrap_or_default();
++                    println!("cargo::rustc-env=FOO_VALUE={value}");
++                }
++            "#,
++        )
++        .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.1"))
++        .file("bar/src/lib.rs", "")
++        .build();
++    build(&p).env("FOO_VALUE_SOURCE", "a").run();
++
++    build(&p)
++        .env("FOO_VALUE_SOURCE", "b")
++        .with_stderr_contains("[RUNNING] `rustc --crate-name foo [..]--crate-type lib [..]")
++        .run();
++}

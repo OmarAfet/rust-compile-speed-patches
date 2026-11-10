@@ -1,0 +1,697 @@
+From 15b82d903f07d402ee4dd103977f4b474fd04e5b Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:02:52 +0300
+Subject: [PATCH 3/5] Leave diagnostic-only span positions out of the public
+ API hash
+
+The public API hash decides whether a dependent crate has to be compiled again. It included the positions of all spans in the metadata, so adding a line at the top of a file changed the hash of every item below it, and all dependents were compiled again, even though nothing they compile changed.
+
+Most spans in the metadata are only read by dependents to report diagnostics: bounds, generics, attributes, identifiers, module children, trait definitions. Tables of those are now hashed with `RDRHashAllDiagnosticSpans`, which hashes each span by its file and syntax context, and collects the positions in a separate hash. `def_span` positions stay in the public hash only when they can reach downstream machine code (`def_span_reaches_codegen`): debug info of MIR that dependents instantiate, and shims they generate. `mir_for_ctfe` bodies keep their positions when const evaluation may turn them into values through the `caller_location` intrinsic, and for constructors, which are also code generated. Without codegen (`--emit=metadata`, as `cargo check` uses), no position reaches machine code.
+
+The positions left out are stored as `span_positions_hash` in the metadata, and every query that reads another crate now also depends on the `public_span_positions_hash` query, so incremental compilation of dependents still notices moved spans, for example in cached diagnostics.
+
+A span whose position is left out is hashed in place instead of being recorded as a node of the reachability graph, whose node hashes include positions.
+---
+ .../src/rmeta/decoder/cstore_impl.rs          |   9 +-
+ compiler/rustc_metadata/src/rmeta/encoder.rs  | 139 +++++++++++++++---
+ .../src/rmeta/encoder/public_api_hasher.rs    |  23 ++-
+ compiler/rustc_metadata/src/rmeta/mod.rs      |  34 ++---
+ compiler/rustc_metadata/src/rmeta/table.rs    |   5 +
+ compiler/rustc_middle/src/ich.rs              |  48 +++++-
+ compiler/rustc_middle/src/queries.rs          |   8 +
+ .../rdr-public-hash-moved-items/dep.rs        |  30 ++++
+ .../rdr-public-hash-moved-items/rmake.rs      |  72 +++++++++
+ 9 files changed, 322 insertions(+), 46 deletions(-)
+ create mode 100644 tests/run-make/rdr-public-hash-moved-items/dep.rs
+ create mode 100644 tests/run-make/rdr-public-hash-moved-items/rmake.rs
+
+diff --git a/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs b/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
+index 4094b94fc..d317852ff 100644
+--- a/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
++++ b/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
+@@ -158,7 +158,9 @@ fn $name<'tcx>(
+             // the `public_api_hash` does not change.
+             use rustc_middle::dep_graph::DepKind;
+             match DepKind::$name {
+-                DepKind::public_api_hash | DepKind::crate_hash => (),
++                DepKind::public_api_hash
++                | DepKind::public_span_positions_hash
++                | DepKind::crate_hash => (),
+                 DepKind::exported_generic_symbols | DepKind::exported_non_generic_symbols => {
+                     // FIXME should this be some kind of linking_hash? These should only be read
+                     // when we are doing linking
+@@ -166,6 +168,8 @@ fn $name<'tcx>(
+                 }
+                 _ => {
+                     $tcx.ensure_ok().public_api_hash($def_id.krate);
++                    // Query results can contain span positions that the public hash leaves out.
++                    $tcx.ensure_ok().public_span_positions_hash($def_id.krate);
+                 }
+             }
+ 
+@@ -538,6 +542,9 @@ fn into_args(self) -> (DefId, SimplifiedType) {
+             Fingerprint::from_le_bytes(cdata.root.header.hashes.public_hash.as_u128().to_le_bytes())
+         }
+     }
++    public_span_positions_hash => {
++        cdata.root.rdr_hashes.as_ref().map_or(Fingerprint::ZERO, |hashes| hashes.span_positions_hash)
++    }
+     public_global_hash => {
+         if let Some(rdr_hashes) = cdata.root.rdr_hashes.as_ref() {
+             rdr_hashes.public_global_hash
+diff --git a/compiler/rustc_metadata/src/rmeta/encoder.rs b/compiler/rustc_metadata/src/rmeta/encoder.rs
+index 6f292accb..e6e758ed6 100644
+--- a/compiler/rustc_metadata/src/rmeta/encoder.rs
++++ b/compiler/rustc_metadata/src/rmeta/encoder.rs
+@@ -25,11 +25,12 @@
+ use rustc_hir_pretty::id_to_string;
+ use rustc_middle::dep_graph::WorkProductId;
+ use rustc_middle::ich::StableHashState;
++use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+ use rustc_middle::middle::dependency_format::Linkage;
+ use rustc_middle::middle::exported_symbols::SymbolExportLevel;
+ use rustc_middle::middle::privacy::EffectiveVisibilities;
+ use rustc_middle::middle::resolve::ModChild;
+-use rustc_middle::mir::interpret;
++use rustc_middle::mir::{self, interpret};
+ use rustc_middle::query::Providers;
+ use rustc_middle::traits::specialization_graph;
+ use rustc_middle::ty::codec::TyEncoder;
+@@ -280,6 +281,8 @@ pub(super) struct EncodeContext<'a, 'tcx, M: MetadataEncoder<'tcx>> {
+     // Used for both `Symbol`s and `ByteSymbol`s.
+     symbol_index_table: FxHashMap<u32, usize>,
+     spec_encoder_data: M,
++    // See `with_ignored_span_positions`.
++    ignore_span_positions: bool,
+ }
+ 
+ /// If the current crate is a proc-macro, returns early with `LazyArray::default()`.
+@@ -398,7 +401,10 @@ fn encode_expn_id(&mut self, expn_id: ExpnId) {
+     }
+ 
+     fn encode_span(&mut self, span: Span) {
+-        self.record_encoded_index(span);
++        // A span whose position is ignored is hashed in place, by its file and syntax context.
++        if !self.ignore_span_positions {
++            self.record_encoded_index(span);
++        }
+         match self.span_shorthands.entry(span) {
+             Entry::Occupied(o) => {
+                 // If an offset is smaller than the absolute position, we encode with the offset.
+@@ -669,15 +675,18 @@ macro_rules! record {
+     }};
+     ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr, $hcx:ident, $hashed_value:expr, $record_mode:expr) => {{
+         {
+-            let lazy = $self.with_record_mode($record_mode(Node::DefId($def_id)), |this|
+-                this.lazy($value)
+-            );
+-            $self.$tables.$table.set_some_hashed(
+-                $def_id.index,
+-                lazy,
+-                ($def_id, $hashed_value),
+-                $hcx,
+-            );
++            let ignore = $self.$tables.$table.ignores_span_positions();
++            $self.with_ignored_span_positions(ignore, $hcx, |this, $hcx| {
++                let lazy = this.with_record_mode($record_mode(Node::DefId($def_id)), |this|
++                    this.lazy($value)
++                );
++                this.$tables.$table.set_some_hashed(
++                    $def_id.index,
++                    lazy,
++                    ($def_id, $hashed_value),
++                    $hcx,
++                );
++            })
+         }
+     }};
+ }
+@@ -694,10 +703,14 @@ macro_rules! record_array {
+     ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr, $hcx:ident, $encode_map:expr, $record_mode:expr) => {{
+         {
+             let value = $value;
+-            let mut hasher = $self.$tables.$table.iter_hasher();
+-            let lazy = $self.with_record_mode($record_mode(Node::DefId($def_id)), |this|
+-                this.lazy_array(hasher.inspect_digest(value, $hcx).map($encode_map))
+-            );
++            let ignore = $self.$tables.$table.ignores_span_positions();
++            let (lazy, hasher) = $self.with_ignored_span_positions(ignore, $hcx, |this, $hcx| {
++                let mut hasher = this.$tables.$table.iter_hasher();
++                let lazy = this.with_record_mode($record_mode(Node::DefId($def_id)), |this|
++                    this.lazy_array(hasher.inspect_digest(value, $hcx).map($encode_map))
++                );
++                (lazy, hasher)
++            });
+             $self.$tables.$table.set_some_hashed(
+                 $def_id.index,
+                 lazy,
+@@ -718,10 +731,14 @@ macro_rules! record_defaulted_array {
+     ($self:ident.$tables:ident.$table:ident[$def_id:expr] <- $value:expr, $hcx:ident, $encode_map:expr, $record_mode:expr) => {{
+         {
+             let value = $value;
+-            let mut hasher = $self.$tables.$table.iter_hasher();
+-            let lazy = $self.with_record_mode($record_mode(Node::DefId($def_id)), |this|
+-                this.lazy_array(hasher.inspect_digest(value, $hcx).map($encode_map))
+-            );
++            let ignore = $self.$tables.$table.ignores_span_positions();
++            let (lazy, hasher) = $self.with_ignored_span_positions(ignore, $hcx, |this, $hcx| {
++                let mut hasher = this.$tables.$table.iter_hasher();
++                let lazy = this.with_record_mode($record_mode(Node::DefId($def_id)), |this|
++                    this.lazy_array(hasher.inspect_digest(value, $hcx).map($encode_map))
++                );
++                (lazy, hasher)
++            });
+             $self.$tables.$table.set_hashed(
+                 $def_id.index,
+                 lazy,
+@@ -754,6 +771,26 @@ fn record_raw_def_id(&mut self, def_id: DefId) -> RawDefId {
+         M::into_raw_def_id(self.tcx, def_id)
+     }
+ 
++    /// Downstream crates use the positions of most spans only for diagnostics, so these positions
++    /// are left out of the public API hash, and moving an item to another line does not force its
++    /// dependents to be rebuilt. Spans whose position can end up in downstream machine code (MIR,
++    /// macro definitions, see `def_span_reaches_codegen`) are encoded without this. Nested calls
++    /// can only turn ignoring on.
++    fn with_ignored_span_positions<'h, H: PublicApiHashState<'h>, T>(
++        &mut self,
++        ignore: bool,
++        hcx: &mut H,
++        f: impl FnOnce(&mut Self, &mut H) -> T,
++    ) -> T {
++        let previous = self.ignore_span_positions;
++        self.ignore_span_positions |= ignore;
++        hcx.hcx_mut().set_ignore_span_positions(self.ignore_span_positions);
++        let result = f(self, hcx);
++        self.ignore_span_positions = previous;
++        hcx.hcx_mut().set_ignore_span_positions(previous);
++        result
++    }
++
+     #[inline]
+     fn record_encoded_index(&mut self, index: impl Into<Node<'tcx>>) {
+         self.spec_encoder_data.record_encoded_index(index.into());
+@@ -1506,6 +1543,54 @@ fn should_encode_mir(
+     }
+ }
+ 
++/// Whether downstream crates can put the position of this definition's span into machine code: the
++/// debug info of code they generate for it, from its MIR or as a shim. Every other downstream use of
++/// `def_span` is a diagnostic.
++fn def_span_reaches_codegen(tcx: TyCtxt<'_>, def_id: LocalDefId, def_kind: DefKind) -> bool {
++    // A crate built without codegen, such as by `cargo check`, only provides metadata, and its
++    // dependents are built without codegen too.
++    if !tcx.sess.opts.output_types.should_codegen() {
++        return false;
++    }
++    if tcx.sess.opts.unstable_opts.debug_info_type_line_numbers
++        || tcx.sess.is_sanitizer_kcfi_enabled()
++    {
++        return true;
++    }
++    match def_kind {
++        DefKind::Ctor(_, CtorKind::Fn) | DefKind::SyntheticCoroutineBody => true,
++        DefKind::Fn | DefKind::AssocFn | DefKind::Closure => {
++            should_encode_mir(tcx, tcx.reachable_set(()), def_id).1
++                // Reify shims for function pointers.
++                || tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::TRACK_CALLER)
++                // Vtable shims, and reify shims for virtual calls.
++                || tcx.def_kind(tcx.local_parent(def_id)) == DefKind::Trait
++        }
++        // Thread local shims.
++        DefKind::Static { .. } => {
++            tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::THREAD_LOCAL)
++        }
++        _ => false,
++    }
++}
++
++/// Const evaluation in downstream crates turns span positions of this body into values only
++/// through the `caller_location` intrinsic, which `#[track_caller]` functions such as
++/// `Location::caller()` call; otherwise the positions only show up in diagnostics. Calls of
++/// trait methods or of unknown functions may reach such a function.
++fn ctfe_may_use_caller_location(tcx: TyCtxt<'_>, body: &mir::Body<'_>) -> bool {
++    body.basic_blocks.iter().any(|block| match &block.terminator().kind {
++        mir::TerminatorKind::Call { func, .. } | mir::TerminatorKind::TailCall { func, .. } => {
++            func.const_fn_def().is_none_or(|(def_id, _)| {
++                tcx.trait_of_assoc(def_id).is_some()
++                    || tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::TRACK_CALLER)
++                    || tcx.intrinsic(def_id).is_some_and(|i| i.name == sym::caller_location)
++            })
++        }
++        _ => false,
++    })
++}
++
+ fn should_encode_variances<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, def_kind: DefKind) -> bool {
+     match def_kind {
+         DefKind::Struct
+@@ -1829,8 +1914,10 @@ fn encode_def_ids<'h>(&mut self, hcx: &mut impl PublicApiHashState<'h>) {
+             }
+ 
+             if should_encode_span(def_kind) {
+-                let def_span = tcx.def_span(local_id);
+-                record!(self.tables.def_span[def_id] <- def_span, hcx);
++                let ignore = !def_span_reaches_codegen(tcx, local_id, def_kind);
++                self.with_ignored_span_positions(ignore, hcx, |this, hcx| {
++                    record!(this.tables.def_span[def_id] <- tcx.def_span(local_id), hcx);
++                });
+             }
+             if should_encode_attrs(def_kind) {
+                 self.encode_attrs(local_id, hcx);
+@@ -2303,7 +2390,14 @@ fn encode_mir<'h>(&mut self, hcx: &mut impl PublicApiHashState<'h>) {
+                     record!(self.tables.trivial_const[def_id.to_def_id()] <- (val, ty), hcx);
+                 } else {
+                     is_trivial = false;
+-                    record!(self.tables.mir_for_ctfe[def_id.to_def_id()] <- tcx.mir_for_ctfe(def_id), hcx);
++                    let body = tcx.mir_for_ctfe(def_id);
++                    // Constructors are also code generated from this body.
++                    let codegen = tcx.sess.opts.output_types.should_codegen()
++                        && matches!(tcx.def_kind(def_id), DefKind::Ctor(..));
++                    let ignore = !codegen && !ctfe_may_use_caller_location(tcx, body);
++                    self.with_ignored_span_positions(ignore, hcx, |this, hcx| {
++                        record!(this.tables.mir_for_ctfe[def_id.to_def_id()] <- body, hcx);
++                    });
+                 }
+ 
+                 // FIXME(generic_const_exprs): this feels wrong to have in `encode_mir`
+@@ -3238,6 +3332,7 @@ fn with_encode_metadata_header<'tcx, M: MetadataEncoder<'tcx>>(
+         hygiene_ctxt: &hygiene_ctxt,
+         symbol_index_table: Default::default(),
+         spec_encoder_data: Default::default(),
++        ignore_span_positions: false,
+     };
+ 
+     // Encode the rustc version string in a predictable location.
+diff --git a/compiler/rustc_metadata/src/rmeta/encoder/public_api_hasher.rs b/compiler/rustc_metadata/src/rmeta/encoder/public_api_hasher.rs
+index 175c151e9..a5778819b 100644
+--- a/compiler/rustc_metadata/src/rmeta/encoder/public_api_hasher.rs
++++ b/compiler/rustc_metadata/src/rmeta/encoder/public_api_hasher.rs
+@@ -192,6 +192,9 @@ pub(crate) fn digest<'a, T: StableHash>(
+ pub(crate) trait TablePublicApiHasher<I: Idx>: Default {
+     type IterHasher;
+ 
++    /// See `EncodeContext::with_ignored_span_positions`.
++    const IGNORE_SPAN_POSITIONS: bool = false;
++
+     fn digest<'a, V>(
+         &mut self,
+         index: impl TableIndex<Encoded = I>,
+@@ -203,11 +206,15 @@ fn digest<'a, V>(
+     fn iter_hasher(&self) -> Self::IterHasher;
+ }
+ 
+-pub(crate) struct RDRHashAll<I: Idx> {
++pub(crate) struct RDRHashAll<I: Idx, const IGNORE_SPAN_POSITIONS: bool = false> {
+     _marker: std::marker::PhantomData<I>,
+ }
+ 
+-impl<I: Idx> Default for RDRHashAll<I> {
++/// Hashes the table like `RDRHashAll`, but downstream crates use the positions of the spans in it
++/// only for diagnostics, so these positions are left out of the public API hash.
++pub(crate) type RDRHashAllDiagnosticSpans<I> = RDRHashAll<I, true>;
++
++impl<I: Idx, const IGNORE_SPAN_POSITIONS: bool> Default for RDRHashAll<I, IGNORE_SPAN_POSITIONS> {
+     fn default() -> Self {
+         Self { _marker: Default::default() }
+     }
+@@ -261,8 +268,11 @@ pub(crate) fn new(hcx: StableHashState<'a, false>) -> Self {
+     }
+ }
+ 
+-impl<I: Idx> TablePublicApiHasher<I> for RDRHashAll<I> {
++impl<I: Idx, const IGNORE_SPAN_POSITIONS: bool> TablePublicApiHasher<I>
++    for RDRHashAll<I, IGNORE_SPAN_POSITIONS>
++{
+     type IterHasher = OrderedIterHasher;
++    const IGNORE_SPAN_POSITIONS: bool = IGNORE_SPAN_POSITIONS;
+     #[inline(always)]
+     fn digest<'a, V>(
+         &mut self,
+@@ -594,7 +604,8 @@ pub(super) fn crate_hashes<'tcx, 'h>(
+     debug!("crate_hashes: public_hashes roots hash = {:?}", public_hashes.hash);
+     public_global_hash.stable_hash(hcx.hcx_mut(), &mut hasher);
+     public_hashes.stable_hash(hcx.hcx_mut(), &mut hasher);
+-    let rdr_hashes = public_hashes.value.encode(ecx, public_global_hash);
++    let span_positions_hash = hcx.hcx_mut().ignored_span_positions();
++    let rdr_hashes = public_hashes.value.encode(ecx, public_global_hash, span_positions_hash);
+     let public_hash = Svh::new(hasher.finish());
+     debug!("Hashed crate root: {root:#x?}");
+     debug!("public api hash: {}", public_hash);
+@@ -1122,11 +1133,13 @@ fn encode<'a, 'tcx, M: MetadataEncoder<'tcx>>(
+         &self,
+         ecx: &mut EncodeContext<'a, 'tcx, M>,
+         public_global_hash: Fingerprint,
++        span_positions_hash: Fingerprint,
+     ) -> ItemPublicHashes {
+         ItemPublicHashes {
+             local: self.local.encode(ecx).0,
+             expn: self.expn.encode(ecx).0,
+             public_global_hash,
++            span_positions_hash,
+         }
+     }
+ }
+@@ -1136,4 +1149,6 @@ pub(crate) struct ItemPublicHashes {
+     pub(crate) local: LazyTable<DefIndex, Option<Fingerprint>>,
+     pub(crate) expn: LazyTable<ExpnIndex, Option<Fingerprint>>,
+     pub(crate) public_global_hash: Fingerprint,
++    /// Positions of the spans that the public hash leaves out, see `with_ignored_span_positions`.
++    pub(crate) span_positions_hash: Fingerprint,
+ }
+diff --git a/compiler/rustc_metadata/src/rmeta/mod.rs b/compiler/rustc_metadata/src/rmeta/mod.rs
+index 030a58c1f..0091a9ae6 100644
+--- a/compiler/rustc_metadata/src/rmeta/mod.rs
++++ b/compiler/rustc_metadata/src/rmeta/mod.rs
+@@ -48,7 +48,7 @@
+ use crate::eii::EiiMapEncodedKeyValue;
+ use crate::rmeta::encoder::MetadataEncoder;
+ use crate::rmeta::encoder::public_api_hasher::{
+-    GraphHashed, ItemPublicHashes, RDRHashAll, RDRHashNone,
++    GraphHashed, ItemPublicHashes, RDRHashAll, RDRHashAllDiagnosticSpans, RDRHashNone,
+ };
+ 
+ mod decoder;
+@@ -453,20 +453,20 @@ fn encode<'tcx, M: MetadataEncoder<'tcx>>(
+     //
+     // We don't need to include this in the hash since we are saving DefIndex as its stable hash
+     def_path_hashes: Table<RDRHashNone, DefIndex, u64>,
+-    explicit_item_bounds: Table<RDRHashAll, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+-    explicit_item_self_bounds: Table<RDRHashAll, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+-    inferred_outlives_of: Table<RDRHashAll, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+-    explicit_super_clauses_of: Table<RDRHashAll, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+-    explicit_implied_clauses_of: Table<RDRHashAll, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
+-    explicit_implied_const_bounds: Table<RDRHashAll, DefIndex, LazyArray<(ty::PolyTraitRef<'static>, Span)>>,
++    explicit_item_bounds: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
++    explicit_item_self_bounds: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
++    inferred_outlives_of: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
++    explicit_super_clauses_of: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
++    explicit_implied_clauses_of: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<(ty::Clause<'static>, Span)>>,
++    explicit_implied_const_bounds: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<(ty::PolyTraitRef<'static>, Span)>>,
+     inherent_impls: Table<RDRHashAll, DefIndex, LazyArray<DefIndex>>,
+     opt_rpitit_info: Table<RDRHashAll, DefIndex, Option<LazyValue<ty::ImplTraitInTraitData>>>,
+     // Reexported names are not associated with individual `DefId`s,
+     // e.g. a glob import can introduce a lot of names, all with the same `DefId`.
+     // That's why the encoded list needs to contain `ModChild` structures describing all the names
+     // individually instead of `DefId`s.
+-    module_children_reexports: Table<RDRHashAll, DefIndex, LazyArray<ModChild>>,
+-    ambig_module_children: Table<RDRHashAll, DefIndex, LazyArray<AmbigModChild>>,
++    module_children_reexports: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<ModChild>>,
++    ambig_module_children: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<AmbigModChild>>,
+     cross_crate_inlinable: Table<RDRHashAll, DefIndex, bool>,
+     asyncness: Table<RDRHashAll, DefIndex, ty::Asyncness>,
+     constness: Table<RDRHashAll, DefIndex, hir::Constness>,
+@@ -478,7 +478,7 @@ fn encode<'tcx, M: MetadataEncoder<'tcx>>(
+     is_reachable_non_generic_with_export_level_c: Table<RDRHashAll, DefIndex, bool>,
+ 
+ - optional:
+-    attributes: Table<RDRHashAll, DefIndex, LazyArray<hir::Attribute>>,
++    attributes: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<hir::Attribute>>,
+     // For non-reexported names in a module every name is associated with a separate `DefId`,
+     // so we can take their names, visibilities etc from other encoded tables.
+     module_children_non_reexports: Table<RDRHashAll, DefIndex, LazyArray<DefIndex>>,
+@@ -486,13 +486,13 @@ fn encode<'tcx, M: MetadataEncoder<'tcx>>(
+     def_kind: Table<RDRHashAll, DefIndex, DefKind>,
+     visibility: Table<RDRHashAll, DefIndex, LazyValue<ty::Visibility<DefIndex>>>,
+     def_span: Table<RDRHashAll, DefIndex, LazyValue<Span>>,
+-    def_ident_span: Table<RDRHashAll, DefIndex, LazyValue<Span>>,
++    def_ident_span: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyValue<Span>>,
+     lookup_stability: Table<RDRHashAll, DefIndex, LazyValue<hir::Stability>>,
+     lookup_const_stability: Table<RDRHashAll, DefIndex, LazyValue<hir::ConstStability>>,
+     lookup_default_body_stability: Table<RDRHashAll, DefIndex, LazyValue<hir::DefaultBodyStability>>,
+     lookup_deprecation_entry: Table<RDRHashAll, DefIndex, LazyValue<attrs::Deprecation>>,
+-    explicit_clauses_of: Table<RDRHashAll, DefIndex, LazyValue<ty::GenericClauses<'static>>>,
+-    generics_of: Table<RDRHashAll, DefIndex, LazyValue<ty::Generics>>,
++    explicit_clauses_of: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyValue<ty::GenericClauses<'static>>>,
++    generics_of: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyValue<ty::Generics>>,
+     type_of: Table<RDRHashAll, DefIndex, LazyValue<ty::EarlyBinder<'static, Ty<'static>>>>,
+     variances_of: Table<RDRHashAll, DefIndex, LazyArray<ty::Variance>>,
+     fn_sig: Table<RDRHashAll, DefIndex, LazyValue<ty::EarlyBinder<'static, ty::PolyFnSig<'static>>>>,
+@@ -508,20 +508,20 @@ fn encode<'tcx, M: MetadataEncoder<'tcx>>(
+     promoted_mir: Table<RDRHashAll, DefIndex, LazyValue<IndexVec<mir::Promoted, mir::Body<'static>>>>,
+     thir_abstract_const: Table<RDRHashAll, DefIndex, LazyValue<ty::EarlyBinder<'static, ty::Const<'static>>>>,
+     impl_parent: Table<RDRHashAll, DefIndex, RawDefId>,
+-    const_conditions: Table<RDRHashAll, DefIndex, LazyValue<ty::ConstConditions<'static>>>,
++    const_conditions: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyValue<ty::ConstConditions<'static>>>,
+     // FIXME(eddyb) perhaps compute this on the fly if cheap enough?
+     coerce_unsized_info: Table<RDRHashAll, DefIndex, LazyValue<ty::adjustment::CoerceUnsizedInfo>>,
+     mir_const_qualif: Table<RDRHashAll, DefIndex, LazyValue<mir::ConstQualifs>>,
+     rendered_const: Table<RDRHashAll, DefIndex, LazyValue<String>>,
+     rendered_precise_capturing_args: Table<RDRHashAll, DefIndex, LazyArray<PreciseCapturingArgKind<Symbol, Symbol>>>,
+-    fn_arg_idents: Table<RDRHashAll, DefIndex, LazyArray<Option<Ident>>>,
++    fn_arg_idents: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<Option<Ident>>>,
+     coroutine_kind: Table<RDRHashAll, DefIndex, hir::CoroutineKind>,
+     coroutine_for_closure: Table<RDRHashAll, DefIndex, RawDefId>,
+     adt_destructor: Table<RDRHashAll, DefIndex, LazyValue<ty::Destructor>>,
+     adt_async_destructor: Table<RDRHashAll, DefIndex, LazyValue<ty::AsyncDestructor>>,
+     coroutine_by_move_body_def_id: Table<RDRHashAll, DefIndex, RawDefId>,
+     eval_static_initializer: Table<RDRHashAll, DefIndex, LazyValue<mir::interpret::ConstAllocation<'static>>>,
+-    trait_def: Table<RDRHashAll, DefIndex, LazyValue<ty::TraitDef>>,
++    trait_def: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyValue<ty::TraitDef>>,
+     expn_that_defined: Table<RDRHashAll, DefIndex, LazyValue<ExpnId>>,
+     default_fields: Table<RDRHashAll, DefIndex, LazyValue<DefId>>,
+     params_in_repr: Table<RDRHashAll, DefIndex, LazyValue<DenseBitSet<u32>>>,
+@@ -541,7 +541,7 @@ fn encode<'tcx, M: MetadataEncoder<'tcx>>(
+     collect_return_position_impl_trait_in_trait_tys: Table<RDRHashAll, DefIndex, LazyValue<DefIdMap<ty::EarlyBinder<'static, Ty<'static>>>>>,
+     doc_link_resolutions: Table<RDRHashAll, DefIndex, LazyValue<DocLinkResMap>>,
+     doc_link_traits_in_scope: Table<RDRHashAll, DefIndex, LazyArray<DefId>>,
+-    assumed_wf_types_for_rpitit: Table<RDRHashAll, DefIndex, LazyArray<(Ty<'static>, Span)>>,
++    assumed_wf_types_for_rpitit: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyArray<(Ty<'static>, Span)>>,
+     opaque_ty_origin: Table<RDRHashAll, DefIndex, LazyValue<hir::OpaqueTyOrigin<DefId>>>,
+     anon_const_kind: Table<RDRHashAll, DefIndex, LazyValue<ty::AnonConstKind>>,
+     const_of_item: Table<RDRHashAll, DefIndex, LazyValue<Option<ty::EarlyBinder<'static, ty::Const<'static>>>>>,
+diff --git a/compiler/rustc_metadata/src/rmeta/table.rs b/compiler/rustc_metadata/src/rmeta/table.rs
+index b877d0f5d..4aab0dac6 100644
+--- a/compiler/rustc_metadata/src/rmeta/table.rs
++++ b/compiler/rustc_metadata/src/rmeta/table.rs
+@@ -584,6 +584,11 @@ pub(super) fn set_some_unhashed(&mut self, i: I, value: T) {
+ impl<H: TablePublicApiHasher<I>, I: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]>>
+     TableBuilder<H, I, T>
+ {
++    #[inline(always)]
++    pub(super) fn ignores_span_positions(&self) -> bool {
++        H::IGNORE_SPAN_POSITIONS
++    }
++
+     #[inline(always)]
+     pub(super) fn iter_hasher(&self) -> H::IterHasher {
+         self.hasher.iter_hasher()
+diff --git a/compiler/rustc_middle/src/ich.rs b/compiler/rustc_middle/src/ich.rs
+index 4a69cf94d..f6e7787f5 100644
+--- a/compiler/rustc_middle/src/ich.rs
++++ b/compiler/rustc_middle/src/ich.rs
+@@ -28,21 +28,48 @@ pub struct StableHashState<'a, const HASH_SPANS_AS_PARENTLESS: bool = false> {
+     incremental_ignore_spans: bool,
+     caching_source_map: CachingSourceMap<'a>,
+     stable_hash_controls: StableHashControls,
++    // Public API hashing only: hash spans by syntax context and file, and collect their positions
++    // separately in `ignored_span_positions`.
++    ignore_span_positions: bool,
++    ignored_span_positions: Fingerprint,
+ }
+ 
+ impl<'a> StableHashState<'a, false> {
+     pub fn hash_spans_as_parentless(self) -> StableHashState<'a, true> {
+-        let Self { untracked, incremental_ignore_spans, caching_source_map, stable_hash_controls } =
+-            self;
++        let Self {
++            untracked,
++            incremental_ignore_spans,
++            caching_source_map,
++            stable_hash_controls,
++            ignore_span_positions,
++            ignored_span_positions,
++        } = self;
+         StableHashState {
+             untracked,
+             incremental_ignore_spans,
+             caching_source_map,
+             stable_hash_controls,
++            ignore_span_positions,
++            ignored_span_positions,
+         }
+     }
+ }
+ 
++impl<'a> StableHashState<'a, true> {
++    /// Downstream crates read the position of some spans only to report diagnostics, never to
++    /// generate code. Leaving those positions out of the public API hash means that moving an item
++    /// to another line does not force its dependents to be rebuilt.
++    pub fn set_ignore_span_positions(&mut self, ignore: bool) {
++        self.ignore_span_positions = ignore;
++    }
++
++    /// The positions left out so far. Incremental compilation of downstream crates still depends on
++    /// them, because cached diagnostics may show them.
++    pub fn ignored_span_positions(&self) -> Fingerprint {
++        self.ignored_span_positions
++    }
++}
++
+ impl<'a, const HASH_SPANS_AS_PARENTLESS: bool> StableHashState<'a, HASH_SPANS_AS_PARENTLESS> {
+     #[inline]
+     pub fn new(sess: &'a Session, untracked: &'a Untracked) -> Self {
+@@ -53,6 +80,8 @@ pub fn new(sess: &'a Session, untracked: &'a Untracked) -> Self {
+             incremental_ignore_spans: sess.opts.unstable_opts.incremental_ignore_spans,
+             caching_source_map: CachingSourceMap::Unused(sess.source_map()),
+             stable_hash_controls: StableHashControls { hash_spans: hash_spans_initial },
++            ignore_span_positions: false,
++            ignored_span_positions: Fingerprint::ZERO,
+         }
+     }
+ 
+@@ -137,6 +166,21 @@ fn pack_span_location(
+             return;
+         }
+ 
++        if self.ignore_span_positions {
++            let Some((file, line_lo, col_lo, line_hi, col_hi)) =
++                self.source_map().span_data_to_lines_and_cols(&span)
++            else {
++                Hash::hash(&TAG_INVALID_SPAN, hasher);
++                return;
++            };
++            Hash::hash(&TAG_VALID_SPAN, hasher);
++            Hash::hash(&file.stable_id, hasher);
++            let mut positions = StableHasher::new();
++            Hash::hash(&(line_lo, col_lo, line_hi, col_hi, span.hi - span.lo), &mut positions);
++            self.ignored_span_positions = self.ignored_span_positions.combine(positions.finish());
++            return;
++        }
++
+         let parent = span.parent.map(|parent| self.def_span(parent).data_untracked());
+         if let Some(parent) = parent
+             && parent.contains(span)
+diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
+index 9a805cee5..ea8e74c14 100644
+--- a/compiler/rustc_middle/src/queries.rs
++++ b/compiler/rustc_middle/src/queries.rs
+@@ -2075,6 +2075,14 @@ fn describe_as_module(def_id: impl Into<LocalDefId>, tcx: TyCtxt<'_>) -> String
+         separate_provide_extern
+     }
+ 
++    /// Hash of the span positions that the public api hash of a dependency leaves out. Queries
++    /// reading the dependency depend on it too, so that incremental compilation sees moved spans.
++    query public_span_positions_hash(_: CrateNum) -> Fingerprint {
++        eval_always
++        desc { "looking up the span positions hash of a crate" }
++        separate_provide_extern
++    }
++
+     /// Returns the public api hash of an extern DefId, panics for the local crate
+     query extern_def_public_hash(def_id: DefId) -> Fingerprint {
+         eval_always
+diff --git a/tests/run-make/rdr-public-hash-moved-items/dep.rs b/tests/run-make/rdr-public-hash-moved-items/dep.rs
+new file mode 100644
+index 000000000..bd15daac8
+--- /dev/null
++++ b/tests/run-make/rdr-public-hash-moved-items/dep.rs
+@@ -0,0 +1,30 @@
++#![crate_type = "rlib"]
++
++pub const fn located() -> u32 {
++    core::panic::Location::caller().line()
++}
++pub fn generic<T>(t: T) -> T {
++    t
++}
++pub fn plain() -> u32 {
++    private() + 1
++}
++pub struct S {
++    pub x: u32,
++}
++impl S {
++    pub fn get(&self) -> u32 {
++        self.x
++    }
++    pub const fn make(x: u32) -> S {
++        S { x }
++    }
++}
++pub const C: u32 = 5;
++pub enum E {
++    A,
++    B { x: u8 },
++}
++fn private() -> u32 {
++    2
++}
+diff --git a/tests/run-make/rdr-public-hash-moved-items/rmake.rs b/tests/run-make/rdr-public-hash-moved-items/rmake.rs
+new file mode 100644
+index 000000000..5aad40bfe
+--- /dev/null
++++ b/tests/run-make/rdr-public-hash-moved-items/rmake.rs
+@@ -0,0 +1,72 @@
++// Moving public items to other lines must not change a crate's *public API hash* when downstream
++// crates can only see their positions in diagnostics, but must change it when downstream crates can
++// generate code from the moved items: then the positions end up in their debug info.
++//
++// Like `rdr-public-hash-private-end-of-file-change`, this test rewrites the source file between
++// compilations: the incremental `rdr` tests cannot move an item without also changing the `cfg`
++// attributes that are kept in the metadata.
++
++//@ ignore-cross-compile
++
++use run_make_support::{rfs, rustc};
++
++/// Compile `dep.rs` with debug info and public api hashing, and return its public hash. With
++/// `check`, only metadata is emitted, as for `cargo check`.
++fn compile_and_read_public_hash(check: bool) -> String {
++    let mut cmd = rustc();
++    cmd.input("dep.rs").arg("-Zpublic-api-hash").arg("-g");
++    if check {
++        cmd.emit("metadata");
++    }
++    cmd.run();
++
++    let file = if check { "libdep.rmeta" } else { "libdep.rlib" };
++    let listing = rustc().arg("-Zls=public_hash").input(file).run().stdout_utf8();
++
++    listing
++        .lines()
++        .find_map(|line| line.strip_prefix("Public hash:"))
++        .map(|hash| hash.trim().to_owned())
++        .expect("`-Zls=public_hash` did not print a `Public hash:` line")
++}
++
++/// Insert `line` into `dep.rs` before the first line that starts with `before`.
++fn insert_before(before: &str, line: &str) {
++    let contents = rfs::read_to_string("dep.rs");
++    let at = contents.find(before).expect("anchor line not found");
++    rfs::write("dep.rs", format!("{}{line}\n{}", &contents[..at], &contents[at..]));
++}
++
++fn main() {
++    let baseline = compile_and_read_public_hash(false);
++
++    // Moves every item below `generic`, and none of them can be instantiated downstream (the const
++    // fn `make` is only evaluated there).
++    insert_before("pub fn plain", "// A new line.");
++    let after_top_line = compile_and_read_public_hash(false);
++    assert_eq!(baseline, after_top_line, "public hash changed after moving plain items");
++
++    // A longer private body above public items.
++    insert_before("    2\n}", "    let _unused = 0;");
++    let after_private_body = compile_and_read_public_hash(false);
++    assert_eq!(baseline, after_private_body, "public hash changed after a private body edit");
++
++    // Downstream crates instantiate `generic`, so its position is in their debug info.
++    let check_baseline = compile_and_read_public_hash(true);
++    insert_before("pub fn generic", "// Moves `generic`.");
++    let after_generic_moved = compile_and_read_public_hash(false);
++    assert_ne!(baseline, after_generic_moved, "public hash did not change after moving `generic`");
++
++    // Without codegen, no downstream crate generates code from `generic`.
++    let check_after_generic_moved = compile_and_read_public_hash(true);
++    assert_eq!(check_baseline, check_after_generic_moved, "check-mode hash changed after a move");
++
++    // Const evaluation in downstream crates turns the position of the call to
++    // `Location::caller()` in `located` into a value.
++    insert_before("pub const fn located", "// Moves `located`.");
++    let check_after_located_moved = compile_and_read_public_hash(true);
++    assert_ne!(
++        check_baseline, check_after_located_moved,
++        "hash did not change after moving `located`"
++    );
++}

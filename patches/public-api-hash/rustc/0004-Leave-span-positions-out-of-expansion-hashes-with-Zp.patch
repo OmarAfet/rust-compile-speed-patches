@@ -1,0 +1,182 @@
+From 18860a153d4086f6c3add92019c8c748fca73884 Mon Sep 17 00:00:00 2001
+From: OmarAfet <135471287+OmarAfet@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:14:35 +0300
+Subject: [PATCH 4/5] Leave span positions out of expansion hashes with
+ `-Zpublic-api-hash`
+
+Metadata refers to macro expansions (for example the derived impls of a type) by their `ExpnHash`, and the hash of `ExpnData` includes the call-site span, with its position. So adding a line above a `#[derive]` changed the expansion hashes, and with them the public API hash of every item that the expansion created, even in metadata of a build without codegen, where no position reaches machine code.
+
+With `-Zpublic-api-hash`, `update_disambiguator` now hashes `ExpnData` without span positions: spans are hashed by file and syntax context, like in the tables of the previous commit. Two expansions then only get the same hash when they have the same parent expansion, kind, macro and call-site file and context, for example two derives of the same trait at the root of one file. The existing disambiguator separates them, in the order they are created. This is the same rule that `DefPath` disambiguators of impls, closures and anonymous constants already follow.
+
+Why this is fine for incremental compilation: the option is `[TRACKED]`, so sessions with and without it never mix. An `ExpnHash` stays a unique identity within a session. When two expansions with the same hash swap order between sessions, their identities swap; a cached result that used one of them was hashed with that expansion's data, or depends on queries of the items it created, whose results are hashed, so it is recomputed, just as when the `DefPath`s of two impls swap.
+
+Recorded nodes of the reachability graph would hash positions, so syntax contexts and expansions encoded while positions are ignored are hashed in place, by their hashes. `expn_that_defined` moves to `RDRHashAllDiagnosticSpans`: name resolution compares its value with hygiene (`hygienic_eq`), which depends on the identity and ancestry of the expansion, not on positions, and the identity is still hashed, by the position-free `ExpnHash`.
+---
+ compiler/rustc_data_structures/src/stable_hash.rs  |  4 ++++
+ compiler/rustc_metadata/src/rmeta/encoder.rs       | 14 +++++++++++---
+ compiler/rustc_metadata/src/rmeta/mod.rs           |  2 +-
+ compiler/rustc_middle/src/ich.rs                   |  9 +++++++++
+ compiler/rustc_span/src/hygiene.rs                 |  1 +
+ tests/run-make/rdr-public-hash-moved-items/dep.rs  |  4 ++++
+ .../run-make/rdr-public-hash-moved-items/rmake.rs  |  5 +++--
+ 7 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/compiler/rustc_data_structures/src/stable_hash.rs b/compiler/rustc_data_structures/src/stable_hash.rs
+index 0513c9083..4beaddfa9 100644
+--- a/compiler/rustc_data_structures/src/stable_hash.rs
++++ b/compiler/rustc_data_structures/src/stable_hash.rs
+@@ -35,6 +35,10 @@ pub trait StableHashCtxt {
+     /// Assert that the provided `StableHashCtxt` is configured with the default
+     /// `StableHashControls`. We should always have bailed out before getting to here with a
+     fn assert_default_stable_hash_controls(&self, msg: &str);
++
++    /// With `-Zpublic-api-hash`, expansion hashes leave out span positions, so that moving a macro
++    /// call does not change the hashes of the code it generates.
++    fn ignore_span_positions_for_expansion_hash(&mut self) {}
+ }
+ 
+ // A type used to work around `Span` not being visible in this crate. It is the same layout as
+diff --git a/compiler/rustc_metadata/src/rmeta/encoder.rs b/compiler/rustc_metadata/src/rmeta/encoder.rs
+index e6e758ed6..ed24e2c01 100644
+--- a/compiler/rustc_metadata/src/rmeta/encoder.rs
++++ b/compiler/rustc_metadata/src/rmeta/encoder.rs
+@@ -384,7 +384,9 @@ fn encode_visibility_def_id(&mut self, def_id: VisibilityDefId) {
+ 
+     fn encode_syntax_context(&mut self, syntax_context: SyntaxContext) {
+         rustc_span::hygiene::raw_encode_syntax_context(syntax_context, self.hygiene_ctxt, self);
+-        self.record_encoded_index(syntax_context);
++        if !self.ignore_span_positions {
++            self.record_encoded_index(syntax_context);
++        }
+     }
+ 
+     fn encode_expn_id(&mut self, expn_id: ExpnId) {
+@@ -397,11 +399,17 @@ fn encode_expn_id(&mut self, expn_id: ExpnId) {
+         }
+         expn_id.krate.encode(self);
+         expn_id.local_id.encode(self);
+-        self.record_encoded_index(expn_id);
++        // With ignored positions, the expansion is hashed in place by its hash, which leaves out
++        // positions, see `ignore_span_positions_for_expansion_hash`.
++        if !self.ignore_span_positions {
++            self.record_encoded_index(expn_id);
++        }
+     }
+ 
+     fn encode_span(&mut self, span: Span) {
+-        // A span whose position is ignored is hashed in place, by its file and syntax context.
++        // A span whose position is ignored is hashed in place, by its file and syntax context,
++        // whose expansion hashes leave out positions too, see
++        // `ignore_span_positions_for_expansion_hash`.
+         if !self.ignore_span_positions {
+             self.record_encoded_index(span);
+         }
+diff --git a/compiler/rustc_metadata/src/rmeta/mod.rs b/compiler/rustc_metadata/src/rmeta/mod.rs
+index 0091a9ae6..a8bd6be05 100644
+--- a/compiler/rustc_metadata/src/rmeta/mod.rs
++++ b/compiler/rustc_metadata/src/rmeta/mod.rs
+@@ -522,7 +522,7 @@ fn encode<'tcx, M: MetadataEncoder<'tcx>>(
+     coroutine_by_move_body_def_id: Table<RDRHashAll, DefIndex, RawDefId>,
+     eval_static_initializer: Table<RDRHashAll, DefIndex, LazyValue<mir::interpret::ConstAllocation<'static>>>,
+     trait_def: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyValue<ty::TraitDef>>,
+-    expn_that_defined: Table<RDRHashAll, DefIndex, LazyValue<ExpnId>>,
++    expn_that_defined: Table<RDRHashAllDiagnosticSpans, DefIndex, LazyValue<ExpnId>>,
+     default_fields: Table<RDRHashAll, DefIndex, LazyValue<DefId>>,
+     params_in_repr: Table<RDRHashAll, DefIndex, LazyValue<DenseBitSet<u32>>>,
+     repr_options: Table<RDRHashAll, DefIndex, LazyValue<ReprOptions>>,
+diff --git a/compiler/rustc_middle/src/ich.rs b/compiler/rustc_middle/src/ich.rs
+index f6e7787f5..2604fb34b 100644
+--- a/compiler/rustc_middle/src/ich.rs
++++ b/compiler/rustc_middle/src/ich.rs
+@@ -32,6 +32,8 @@ pub struct StableHashState<'a, const HASH_SPANS_AS_PARENTLESS: bool = false> {
+     // separately in `ignored_span_positions`.
+     ignore_span_positions: bool,
+     ignored_span_positions: Fingerprint,
++    // The value of `-Z public-api-hash`, see `ignore_span_positions_for_expansion_hash`.
++    public_api_hash: bool,
+ }
+ 
+ impl<'a> StableHashState<'a, false> {
+@@ -43,6 +45,7 @@ pub fn hash_spans_as_parentless(self) -> StableHashState<'a, true> {
+             stable_hash_controls,
+             ignore_span_positions,
+             ignored_span_positions,
++            public_api_hash,
+         } = self;
+         StableHashState {
+             untracked,
+@@ -51,6 +54,7 @@ pub fn hash_spans_as_parentless(self) -> StableHashState<'a, true> {
+             stable_hash_controls,
+             ignore_span_positions,
+             ignored_span_positions,
++            public_api_hash,
+         }
+     }
+ }
+@@ -82,6 +86,7 @@ pub fn new(sess: &'a Session, untracked: &'a Untracked) -> Self {
+             stable_hash_controls: StableHashControls { hash_spans: hash_spans_initial },
+             ignore_span_positions: false,
+             ignored_span_positions: Fingerprint::ZERO,
++            public_api_hash: sess.opts.unstable_opts.public_api_hash,
+         }
+     }
+ 
+@@ -270,4 +275,8 @@ fn assert_default_stable_hash_controls(&self, msg: &str) {
+     fn stable_hash_controls(&self) -> StableHashControls {
+         self.stable_hash_controls
+     }
++
++    fn ignore_span_positions_for_expansion_hash(&mut self) {
++        self.ignore_span_positions = self.public_api_hash;
++    }
+ }
+diff --git a/compiler/rustc_span/src/hygiene.rs b/compiler/rustc_span/src/hygiene.rs
+index ac4b7907c..2fb672ad0 100644
+--- a/compiler/rustc_span/src/hygiene.rs
++++ b/compiler/rustc_span/src/hygiene.rs
+@@ -1515,6 +1515,7 @@ fn update_disambiguator(expn_data: &mut ExpnData, mut hcx: impl StableHashCtxt)
+     // This disambiguator should not have been set yet.
+     assert_eq!(expn_data.disambiguator, 0, "Already set disambiguator for ExpnData: {expn_data:?}");
+     hcx.assert_default_stable_hash_controls("ExpnData (disambiguator)");
++    hcx.ignore_span_positions_for_expansion_hash();
+     let mut expn_hash = expn_data.hash_expn(&mut hcx);
+ 
+     let disambiguator = HygieneData::with(|data| {
+diff --git a/tests/run-make/rdr-public-hash-moved-items/dep.rs b/tests/run-make/rdr-public-hash-moved-items/dep.rs
+index bd15daac8..9e95b7d7d 100644
+--- a/tests/run-make/rdr-public-hash-moved-items/dep.rs
++++ b/tests/run-make/rdr-public-hash-moved-items/dep.rs
+@@ -6,6 +6,10 @@ pub const fn located() -> u32 {
+ pub fn generic<T>(t: T) -> T {
+     t
+ }
++#[derive(Debug, Clone)]
++pub struct Derived {
++    pub x: u32,
++}
+ pub fn plain() -> u32 {
+     private() + 1
+ }
+diff --git a/tests/run-make/rdr-public-hash-moved-items/rmake.rs b/tests/run-make/rdr-public-hash-moved-items/rmake.rs
+index 5aad40bfe..ef1a86563 100644
+--- a/tests/run-make/rdr-public-hash-moved-items/rmake.rs
++++ b/tests/run-make/rdr-public-hash-moved-items/rmake.rs
+@@ -40,7 +40,7 @@ fn insert_before(before: &str, line: &str) {
+ fn main() {
+     let baseline = compile_and_read_public_hash(false);
+ 
+-    // Moves every item below `generic`, and none of them can be instantiated downstream (the const
++    // Moves every item below `Derived`, and none of them can be instantiated downstream (the const
+     // fn `make` is only evaluated there).
+     insert_before("pub fn plain", "// A new line.");
+     let after_top_line = compile_and_read_public_hash(false);
+@@ -57,7 +57,8 @@ fn main() {
+     let after_generic_moved = compile_and_read_public_hash(false);
+     assert_ne!(baseline, after_generic_moved, "public hash did not change after moving `generic`");
+ 
+-    // Without codegen, no downstream crate generates code from `generic`.
++    // Without codegen, no downstream crate generates code from `generic` or from the derived
++    // `#[inline]` methods of `Derived`, which moved too.
+     let check_after_generic_moved = compile_and_read_public_hash(true);
+     assert_eq!(check_baseline, check_after_generic_moved, "check-mode hash changed after a move");
+ 
